@@ -1,22 +1,27 @@
-# SLH Railway Stable Pack (API + Bot)
 
-**API** (FastAPI) exposes `/healthz`, `/tokeninfo`, `/balance/{address}`, `/estimate/{op}/{to}/{amount}`, `POST /mint`, `POST /transfer`.
-Same endpoints also work under `/api/...` and `/v1/...`.
+# SLH_Railway_Stable
 
-**Bot** (python-telegram-bot) supports `/start`, `/tokeninfo`, `/balance`, `/estimate`, `/mint`, `/send`.
+Two services ready for Railway:
 
-## Railway ENV
-### slh_API
-- `BSC_RPC_URL` (required)
-- `SELA_TOKEN_ADDRESS` (required, checksummed)
-- `TREASURY_PRIVATE_KEY` + `TREASURY_ADDRESS` (for write ops)
-- `CHAIN_ID=97` (BSC testnet), `SELA_SYMBOL_OVERRIDE=SLH` (optional), `SELA_DECIMALS_OVERRIDE=18` (optional), `GAS_PRICE_FLOOR_WEI` (optional)
+```
+SLH_Railway_Stable/
+ ├─ slh_API/       # FastAPI + Web3
+ └─ SLH_bot/       # Telegram bot (webhook-ready)
+```
 
-Start: `uvicorn src.app:app --host 0.0.0.0 --port 8080`
+## Railway (quick)
+- Create two services from these folders (Dockerfile-based).
+- Fill envs from `env.example` files.
+- API should answer `/healthz`, `/tokeninfo`, `/balance/{address}`.
+- Bot will use webhook if `PUBLIC_URL` is set, otherwise polling.
 
-### SLH_bot
-- `TELEGRAM_BOT_TOKEN` (required)
-- `SLH_API_BASE` (e.g. `https://slhapi-bot.up.railway.app`)
-- `ADMIN_CHAT_IDS` (optional), `LOG_LEVEL=INFO` (optional)
+## Smoke tests (curl)
+```bash
+curl -s https://<api>.railway.app/healthz
+curl -s https://<api>.railway.app/tokeninfo
+curl -s https://<api>.railway.app/balance/0x693db6c817083818696a7228aEbfBd0Cd3371f02
+```
 
-Start: `python -m src.bot`
+## Notes
+- Amounts are in **wei**.
+- For write ops, API requires `TREASURY_PRIVATE_KEY` (+ some BNB testnet for gas).

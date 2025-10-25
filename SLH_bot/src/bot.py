@@ -1,136 +1,108 @@
-import os, logging, httpx
-from typing import List
+
+import os, json, logging, asyncio
+from typing import Optional
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-def _parse_level(val):
-    import logging as _L
-    if val is None: return _L.INFO
-    try: return int(val)
-    except: return getattr(_L, str(val).upper(), _L.INFO)
+API_BASE = os.getenv("SLH_API_BASE", "").rstrip("/")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+WEBHOOK_ROUTE = os.getenv("WEBHOOK_ROUTE", "/webhook")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-logging.basicConfig(level=_parse_level(os.getenv("LOG_LEVEL","INFO")))
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("slh.bot")
 
-API_BASE = os.getenv("SLH_API_BASE","").rstrip("/")
-ADMIN_CHAT_IDS = set([s.strip() for s in os.getenv("ADMIN_CHAT_IDS","").split(",") if s.strip()])
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
-
-if not TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-
-def _api_variants(path:str) -> List[str]:
-    base = API_BASE or ""
-    return [f"{base}{path}", f"{base}/api{path}", f"{base}/v1{path}"]
-
-async def _get_json(paths: List[str]):
-    async with httpx.AsyncClient(timeout=20) as client:
-        for url in paths:
-            r = await client.get(url)
-            if r.status_code == 200:
-                return r.json()
-        raise RuntimeError(f"GET failed for {paths}")
-
-async def _post_json(paths: List[str], payload: dict):
-    async with httpx.AsyncClient(timeout=30) as client:
-        for url in paths:
-            r = await client.post(url, json=payload)
-            if r.status_code == 200:
-                return r.json()
-        raise RuntimeError(f"POST failed for {paths}")
-
-def _is_admin(chat_id: int) -> bool:
-    if not ADMIN_CHAT_IDS: return True
-    return str(chat_id) in ADMIN_CHAT_IDS
+def _api() -> httpx.AsyncClient:
+    if not API_BASE:
+        raise RuntimeError("SLH_API_BASE missing")
+    return httpx.AsyncClient(base_url=API_BASE, timeout=20.0)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "SLH Bot is up!\n"
-        "/tokeninfo – contract stats\n"
+        "SLH Bot is up.\n"
+        "Commands:\n"
+        "/tokeninfo\n"
         "/balance <address>\n"
-        "/estimate <mint|transfer> <to> <amount>\n"
-        "/mint <to> <amount> (owner)\n"
-        "/send <to> <amount> (owner)\n"
+        "/estimate <mint|transfer> <to> <amount_wei>\n"
+        "/mint <to> <amount_wei>\n"
+        "/send <to> <amount_wei>"
     )
 
 async def tokeninfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = await _get_json(_api_variants("/tokeninfo"))
-        await update.message.reply_text(
-            f"Contract: {data.get('contract')}\n"
-            f"Symbol: {data.get('symbol')}\n"
-            f"Decimals: {data.get('decimals')}\n"
-            f"TotalSupply: {data.get('totalSupply')}\n"
-            f"ChainId: {data.get('chainId')}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ tokeninfo failed: {e}")
+    async with _api() as c:
+        r = await c.get("/tokeninfo")
+        if r.status_code != 200:
+            await update.message.reply_text(f"Error: {r.status_code} {r.text}")
+            return
+        data = r.json()
+        await update.message.reply_text(json.dumps(data, indent=2))
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /balance <address>")
         return
     addr = context.args[0]
-    try:
-        data = await _get_json(_api_variants(f"/balance/{addr}"))
-        await update.message.reply_text(
-            f"{data.get('address')}\nBalance: {data.get('balance')} (raw)\nSymbol: {data.get('symbol')}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ balance failed: {e}")
+    async with _api() as c:
+        r = await c.get(f"/balance/{addr}")
+        await update.message.reply_text(r.text)
 
 async def estimate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /estimate <mint|transfer> <to> <amount>")
+        await update.message.reply_text("Usage: /estimate <mint|transfer> <to> <amount_wei>")
         return
     op, to, amount = context.args[0], context.args[1], context.args[2]
-    try:
-        data = await _get_json(_api_variants(f"/estimate/{op}/{to}/{amount}"))
-        await update.message.reply_text(
-            f"op={data.get('op')} to={data.get('to')}\namount={data.get('amount')}\n"
-            f"gasLimit={data.get('gasLimit')} gasPrice={data.get('gasPrice')}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ estimate failed: {e}")
+    async with _api() as c:
+        r = await c.get(f"/estimate/{op}", params={"to": to, "amount": amount})
+        await update.message.reply_text(r.text)
 
-async def mint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Not allowed")
-        return
+async def do_mint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /mint <to> <amount>")
+        await update.message.reply_text("Usage: /mint <to> <amount_wei>")
         return
-    to, amount = context.args[0], int(context.args[1])
-    try:
-        data = await _post_json(_api_variants("/mint"), {"to": to, "amount": amount})
-        await update.message.reply_text(f"✅ submitted: {data.get('hash')}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ mint failed: {e}")
+    to, amount = context.args[0], context.args[1]
+    async with _api() as c:
+        r = await c.post("/mint", json={"to": to, "amount": amount})
+        await update.message.reply_text(r.text)
 
-async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Not allowed")
-        return
+async def do_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /send <to> <amount>")
+        await update.message.reply_text("Usage: /send <to> <amount_wei>")
         return
-    to, amount = context.args[0], int(context.args[1])
-    try:
-        data = await _post_json(_api_variants("/transfer"), {"to": to, "amount": amount})
-        await update.message.reply_text(f"✅ submitted: {data.get('hash')}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ send failed: {e}")
+    to, amount = context.args[0], context.args[1]
+    async with _api() as c:
+        r = await c.post("/transfer", json={"to": to, "amount": amount})
+        await update.message.reply_text(r.text)
 
-def main():
+async def main():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tokeninfo", tokeninfo))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("estimate", estimate))
-    app.add_handler(CommandHandler("mint", mint))
-    app.add_handler(CommandHandler("send", send))
-    log.info("Starting bot (run_polling)...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.add_handler(CommandHandler("mint", do_mint))
+    app.add_handler(CommandHandler("send", do_send))
+
+    if not PUBLIC_URL:
+        log.warning("PUBLIC_URL not set; falling back to polling")
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        log.info("Running polling...")
+        await asyncio.Event().wait()
+    else:
+        route = WEBHOOK_ROUTE if WEBHOOK_ROUTE.startswith("/") else "/" + WEBHOOK_ROUTE
+        log.info("Starting webhook at %s%s", PUBLIC_URL, route)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", "8080")),
+            webhook_url=f"{PUBLIC_URL}{route}",
+            secret_token=None,
+        )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

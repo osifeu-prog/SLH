@@ -1,199 +1,200 @@
-# FastAPI SLH API - BSC Testnet
+
 import os
-from typing import Literal, List
-from fastapi import FastAPI, HTTPException
+from typing import Optional, Literal
+from fastapi import FastAPI, APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from web3 import Web3
-from web3.exceptions import ContractLogicError
+from web3.middleware import geth_poa_middleware
 
-BSC_RPC_URL = os.getenv("BSC_RPC_URL", "").strip()
-SELA_TOKEN_ADDRESS = os.getenv("SELA_TOKEN_ADDRESS", "").strip()
-TREASURY_PRIVATE_KEY = os.getenv("TREASURY_PRIVATE_KEY", "").strip()
-TREASURY_ADDRESS = os.getenv("TREASURY_ADDRESS", "").strip()
-CHAIN_ID = int(os.getenv("CHAIN_ID", "97"))
-SELA_SYMBOL_OVERRIDE = os.getenv("SELA_SYMBOL_OVERRIDE", "").strip() or None
-SELA_DECIMALS_OVERRIDE = os.getenv("SELA_DECIMALS_OVERRIDE", "").strip() or None
-GAS_PRICE_FLOOR_WEI = int(os.getenv("GAS_PRICE_FLOOR_WEI", "0"))
+try:
+    from eth_utils import to_checksum_address as _to_ck
+except Exception:
+    _to_ck = None
+
+# ==== ENV ====
+BSC_RPC_URL           = os.getenv("BSC_RPC_URL", "").strip()
+SELA_TOKEN_ADDRESS    = os.getenv("SELA_TOKEN_ADDRESS", "").strip()
+TREASURY_PRIVATE_KEY  = os.getenv("TREASURY_PRIVATE_KEY", "").strip()   # optional for mint/transfer
+TREASURY_ADDRESS      = os.getenv("TREASURY_ADDRESS", "").strip()       # recommended if PK is set
+CHAIN_ID              = int(os.getenv("CHAIN_ID", "97"))
+SELA_SYMBOL_OVERRIDE  = os.getenv("SELA_SYMBOL_OVERRIDE", "").strip()
+SELA_DECIMALS_OVERRIDE= os.getenv("SELA_DECIMALS_OVERRIDE", "").strip()
+GAS_PRICE_FLOOR_WEI   = int(os.getenv("GAS_PRICE_FLOOR_WEI", "0"))
 
 if not BSC_RPC_URL:
-    raise RuntimeError("Missing BSC_RPC_URL")
-if not SELA_TOKEN_ADDRESS:
-    raise RuntimeError("Missing SELA_TOKEN_ADDRESS")
+    raise RuntimeError("BSC_RPC_URL missing")
 
-w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL))
-if not w3.is_connected():
-    raise RuntimeError("Web3 failed to connect to RPC")
+w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 30}))
+try:
+    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+except Exception:
+    pass
 
-def to_checksum(addr: str) -> str:
+def _ck(addr: str) -> str:
     try:
+        if _to_ck:
+            return _to_ck(addr)
+        if not Web3.is_address(addr):
+            raise ValueError("bad address")
         return Web3.to_checksum_address(addr)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid EIP-55 address")
+        raise HTTPException(status_code=400, detail="invalid address (EIP-55)")
+
+if TREASURY_PRIVATE_KEY and not TREASURY_ADDRESS:
+    acct = w3.eth.account.from_key(TREASURY_PRIVATE_KEY)
+    TREASURY_ADDRESS = acct.address
 
 ERC20_ABI = [
-    {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function","stateMutability":"view"},
-    {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function","stateMutability":"view"},
-    {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function","stateMutability":"view"},
-    {"constant":True,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"type":"function","stateMutability":"view"},
-    {"constant":True,"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function","stateMutability":"view"},
-    {"constant":False,"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function","stateMutability":"nonpayable"},
-    {"constant":False,"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"mint","outputs":[],"type":"function","stateMutability":"nonpayable"},
+    {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"stateMutability":"view","type":"function"},
+    {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"stateMutability":"view","type":"function"},
+    {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
+    {"constant":True,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"constant":True,"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"constant":False,"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+    {"constant":False,"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"mint","outputs":[],"stateMutability":"nonpayable","type":"function"},
 ]
 
-token_addr = to_checksum(SELA_TOKEN_ADDRESS)
-token = w3.eth.contract(address=token_addr, abi=ERC20_ABI)
+def _contract():
+    if not SELA_TOKEN_ADDRESS:
+        raise HTTPException(status_code=500, detail="SELA_TOKEN_ADDRESS not set")
+    return w3.eth.contract(address=_ck(SELA_TOKEN_ADDRESS), abi=ERC20_ABI)
 
-def get_symbol() -> str:
-    if SELA_SYMBOL_OVERRIDE:
-        return SELA_SYMBOL_OVERRIDE
+def _min_gas_price(override: Optional[int]=None) -> int:
+    floor = GAS_PRICE_FLOOR_WEI if GAS_PRICE_FLOOR_WEI > 0 else 0
+    cur = w3.eth.gas_price
+    if override is not None and override > 0:
+        cur = override
+    return max(cur, floor)
+
+app = FastAPI(title="SLH API", version="1.0")
+router = APIRouter()
+
+@router.get("/")
+def index():
+    return {
+        "ok": True,
+        "service": "slh_API",
+        "chain_id": CHAIN_ID,
+        "routes": [
+            "/healthz",
+            "/tokeninfo", "/token/info",
+            "/balance/{address}", "/token/balance/{address}",
+            "/estimate/{op}?to=...&amount=...&gasPriceWei=",
+            "POST /mint", "POST /transfer",
+        ],
+    }
+
+@router.get("/healthz")
+def healthz():
+    return {"ok": bool(w3.is_connected()), "chain_id": CHAIN_ID}
+
+@router.get("/tokeninfo")
+@router.get("/token/info")
+def tokeninfo():
+    c = _contract()
     try:
-        return token.functions.symbol().call()
-    except Exception:
-        return "SLH"
+        name     = c.functions.name().call()
+        symbol   = c.functions.symbol().call()
+        decimals = c.functions.decimals().call()
+        total    = c.functions.totalSupply().call()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"onchain error: {e}")
 
-def get_decimals() -> int:
+    if SELA_SYMBOL_OVERRIDE:
+        symbol = SELA_SYMBOL_OVERRIDE
     if SELA_DECIMALS_OVERRIDE:
         try:
-            return int(SELA_DECIMALS_OVERRIDE)
+            decimals = int(SELA_DECIMALS_OVERRIDE)
         except Exception:
             pass
-    try:
-        return token.functions.decimals().call()
-    except Exception:
-        return 18
 
-def ensure_gas_price(params: dict) -> dict:
-    gp = params.get("gasPrice") or params.get("maxFeePerGas")
-    floor = GAS_PRICE_FLOOR_WEI
-    if floor and (gp is None or gp < floor):
-        params["gasPrice"] = floor
-        params.pop("maxFeePerGas", None)
-        params.pop("maxPriorityFeePerGas", None)
-    return params
+    return {
+        "address": Web3.to_checksum_address(SELA_TOKEN_ADDRESS),
+        "name": name,
+        "symbol": symbol,
+        "decimals": int(decimals),
+        "totalSupply": str(total),
+        "chain_id": CHAIN_ID,
+    }
 
-app = FastAPI(title="SLH API", version="1.0.0")
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-@app.get("/tokeninfo")
-def tokeninfo():
-    sym = get_symbol()
-    decimals = get_decimals()
-    try:
-        ts = token.functions.totalSupply().call()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"totalSupply failed: {e}")
-    return {"contract": token_addr, "symbol": sym, "decimals": decimals, "totalSupply": str(ts), "chainId": CHAIN_ID}
-
-@app.get("/balance/{address}")
+@router.get("/balance/{address}")
+@router.get("/token/balance/{address}")
 def balance(address: str):
-    addr = to_checksum(address)
+    c = _contract()
+    user = _ck(address)
     try:
-        bal = token.functions.balanceOf(addr).call()
+        bal = c.functions.balanceOf(user).call()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"balanceOf failed: {e}")
-    return {"address": addr, "balance": str(bal), "symbol": get_symbol(), "decimals": get_decimals()}
+        raise HTTPException(status_code=502, detail=f"onchain error: {e}")
+    return {"address": user, "balance": str(bal)}
 
-@app.get("/estimate/{op}/{to}/{amount}")
-def estimate(op: Literal["mint","transfer"], to: str, amount: str):
-    to_addr = to_checksum(to)
+@router.get("/estimate/{op}")
+def estimate(
+    op: Literal["mint","transfer"],
+    to: str = Query(..., description="recipient address"),
+    amount: str = Query(..., description="amount in wei (string)"),
+    gasPriceWei: Optional[int] = Query(None)
+):
+    to_ck = _ck(to)
     amt = int(amount)
-    caller = TREASURY_ADDRESS or None
-    if caller is None:
-        raise HTTPException(status_code=400, detail="Missing TREASURY_ADDRESS")
-    if op == "transfer":
-        tx = token.functions.transfer(to_addr, amt).build_transaction({"from": caller})
+    c = _contract()
+
+    if op == "mint":
+        fn = c.functions.mint(to_ck, amt)
+        sender = TREASURY_ADDRESS or to_ck
     else:
-        tx = token.functions.mint(to_addr, amt).build_transaction({"from": caller})
-    tx = ensure_gas_price(tx)
-    gp = tx.get("gasPrice") or tx.get("maxFeePerGas")
-    gl = tx.get("gas", None)
-    if gl is None:
-        try:
-            gl = w3.eth.estimate_gas(tx)
-        except Exception:
-            gl = 120000
-    return {"op": op, "to": to_addr, "amount": str(amt), "gasLimit": int(gl), "gasPrice": int(gp) if gp else None}
+        if not TREASURY_PRIVATE_KEY or not TREASURY_ADDRESS:
+            raise HTTPException(status_code=400, detail="transfer requires TREASURY_PRIVATE_KEY and TREASURY_ADDRESS")
+        fn = c.functions.transfer(to_ck, amt)
+        sender = TREASURY_ADDRESS
 
-class TxRequest(BaseModel):
+    try:
+        tx = fn.build_transaction({
+            "from": sender,
+            "chainId": CHAIN_ID,
+            "nonce": w3.eth.get_transaction_count(sender),
+            "gasPrice": _min_gas_price(gasPriceWei),
+        })
+        gas = w3.eth.estimate_gas(tx)
+        return {"op": op, "to": to_ck, "amount": str(amt), "gas": int(gas), "gasPriceWei": int(tx["gasPrice"])}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"estimate error: {e}")
+
+class TxBody(BaseModel):
     to: str
-    amount: int
+    amount: str
 
-def _require_owner():
+def _send_tx(fn):
     if not TREASURY_PRIVATE_KEY or not TREASURY_ADDRESS:
-        raise HTTPException(status_code=400, detail="Owner credentials missing")
+        raise HTTPException(status_code=400, detail="missing TREASURY_PRIVATE_KEY / TREASURY_ADDRESS")
+    acct  = w3.eth.account.from_key(TREASURY_PRIVATE_KEY)
+    nonce = w3.eth.get_transaction_count(acct.address)
+    tx    = fn.build_transaction({
+        "from": acct.address,
+        "chainId": CHAIN_ID,
+        "nonce": nonce,
+        "gasPrice": _min_gas_price(),
+    })
+    gas   = w3.eth.estimate_gas(tx)
+    tx["gas"] = gas
+    signed = acct.sign_transaction(tx)
+    txh = w3.eth.send_raw_transaction(signed.rawTransaction)
+    return {"txHash": txh.hex(), "gas": int(gas), "gasPriceWei": int(tx["gasPrice"])}
 
-def _sign_and_send(tx):
-    tx = ensure_gas_price(tx)
-    tx["nonce"] = w3.eth.get_transaction_count(TREASURY_ADDRESS)
-    if "gas" not in tx:
-        try:
-            tx["gas"] = w3.eth.estimate_gas(tx)
-        except Exception:
-            tx["gas"] = 200000
-    signed = w3.eth.account.sign_transaction(tx, private_key=TREASURY_PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
-    return tx_hash.hex()
+@router.post("/mint")
+def do_mint(body: TxBody):
+    to_ck = _ck(body.to)
+    amt = int(body.amount)
+    c = _contract()
+    return _send_tx(c.functions.mint(to_ck, amt))
 
-@app.post("/mint")
-def post_mint(req: TxRequest):
-    _require_owner()
-    to_addr = to_checksum(req.to)
-    amt = int(req.amount)
-    try:
-        tx = token.functions.mint(to_addr, amt).build_transaction({"from": TREASURY_ADDRESS, "chainId": CHAIN_ID})
-        h = _sign_and_send(tx)
-        return {"status": "submitted", "hash": h}
-    except ContractLogicError as e:
-        raise HTTPException(status_code=400, detail=f"Contract reverted: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"mint failed: {e}")
+@router.post("/transfer")
+def do_transfer(body: TxBody):
+    to_ck = _ck(body.to)
+    amt = int(body.amount)
+    c = _contract()
+    return _send_tx(c.functions.transfer(to_ck, amt))
 
-@app.post("/transfer")
-def post_transfer(req: TxRequest):
-    _require_owner()
-    to_addr = to_checksum(req.to)
-    amt = int(req.amount)
-    try:
-        tx = token.functions.transfer(to_addr, amt).build_transaction({"from": TREASURY_ADDRESS, "chainId": CHAIN_ID})
-        h = _sign_and_send(tx)
-        return {"status": "submitted", "hash": h}
-    except ContractLogicError as e:
-        raise HTTPException(status_code=400, detail=f"Contract reverted: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"transfer failed: {e}")
-
-# expose also under /api and /v1
-from fastapi import FastAPI as _F, APIRouter
-def clone_routes(src_app: FastAPI):
-    r = APIRouter()
-    for route in src_app.router.routes:
-        path = getattr(route, "path", None)
-        endpoint = getattr(route, "endpoint", None)
-        methods = getattr(route, "methods", None)
-        if path and endpoint and methods:
-            r.add_api_route(path, endpoint=endpoint, methods=list(methods))
-    new_app = _F()
-    new_app.include_router(r)
-    return new_app
-
-api_app = clone_routes(app)
-v1_app = clone_routes(app)
-
-from fastapi.middleware.cors import CORSMiddleware
-for inst in (app, api_app, v1_app):
-    inst.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-root = _F()
-root.mount("/", app)
-root.mount("/api", api_app)
-root.mount("/v1", v1_app)
-app = root
+app.include_router(router)
+app.include_router(router, prefix="/api")
+app.include_router(router, prefix="/v1")
