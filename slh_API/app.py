@@ -13,8 +13,8 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 # ===== ENV =====
 BSC_RPC_URL            = os.getenv("BSC_RPC_URL", "")
 CHAIN_ID               = int(os.getenv("CHAIN_ID", "0") or 0)
-SELA_TOKEN_ADDRESS     = os.getenv("SELA_TOKEN_ADDRESS", "")
-SELA_SYMBOL_OVERRIDE   = os.getenv("SELA_SYMBOL_OVERRIDE")
+SELA_TOKEN_ADDRESS = os.getenv("SELA_TOKEN_ADDRESS", "0xef633c34715a5A581741379c9D690628a1C82B74")
+SELA_SYMBOL_OVERRIDE = os.getenv("SELA_SYMBOL_OVERRIDE")
 SELA_DECIMALS_OVERRIDE = os.getenv("SELA_DECIMALS_OVERRIDE")
 SELA_DECIMALS_OVERRIDE = int(SELA_DECIMALS_OVERRIDE) if SELA_DECIMALS_OVERRIDE else None
 
@@ -212,5 +212,6 @@ def estimate(op: str, to: str, amount: str):
     except Exception:
         raise HTTPException(status_code=400, detail="bad 'to' address")
     return EstimateOut(op=op, to=to, amount=str(amount), note="gas estimation placeholder (to be implemented)")
+
 
 
