@@ -8,10 +8,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 API_BASE = os.getenv("SLH_API_BASE","").rstrip("/")
-MAINNET_API_BASE = os.getenv("MAINNET_API_BASE","").rstrip("/")
-GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK","https://t.me/+HIzvM8sEgh1kNWY0").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL","INFO").upper()
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_CHAT_IDS","").split(",") if x.strip()]
+MAINNET_API_BASE = os.getenv("MAINNET_API_BASE","").rstrip("/")
+GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK","https://t.me/+HIzvM8sEgh1kNWY0").strip()
 
 WEBHOOK_PUBLIC_BASE = os.getenv("BOT_WEBHOOK_PUBLIC_BASE","").rstrip("/")
 WEBHOOK_PATH = os.getenv("BOT_WEBHOOK_PATH","/webhook")
@@ -26,7 +26,7 @@ if not API_BASE: raise RuntimeError("SLH_API_BASE missing")
 
 timeout = Timeout(30.0)
 limits = Limits(max_connections=100, max_keepalive_connections=20)
-HTTP = httpx.AsyncClient(timeout=timeout, limits=limits, headers={"User-Agent": "SLH-Telegram-Bot/2.4"})
+HTTP = httpx.AsyncClient(timeout=timeout, limits=limits, headers={"User-Agent": "SLH-Telegram-Bot/2.3"})
 
 STATE: Dict[int, Dict[str,str]] = {}  # per chat: {"net": "testnet|mainnet", "mode": "user|admin"}
 
@@ -34,8 +34,7 @@ def is_admin(user_id:int)->bool: return user_id in ADMIN_IDS
 
 def api_for(chat_id:int)->str:
     net = STATE.get(chat_id,{}).get("net","testnet")
-    if net=="mainnet" and MAINNET_API_BASE:
-        return MAINNET_API_BASE
+    if net=="mainnet" and MAINNET_API_BASE: return MAINNET_API_BASE
     return API_BASE
 
 def _valid_addr(a: str) -> bool: return re.match(r"^0x[a-fA-F0-9]{40}$", a) is not None
@@ -46,8 +45,7 @@ async def _get(path:str, chat_id:int):
     for p in [path, f"/api{path}", f"/v1{path}"]:
         url = f"{base}{p}"
         r = await HTTP.get(url)
-        if r.status_code==200:
-            return r.json()
+        if r.status_code==200: return r.json()
     raise RuntimeError(f"GET failed for ['{base}{path}','{base}/api{path}','{base}/v1{path}']")
 
 async def _post(path:str, payload:dict, chat_id:int):
@@ -55,8 +53,7 @@ async def _post(path:str, payload:dict, chat_id:int):
     for p in [path, f"/api{path}", f"/v1{path}"]:
         url = f"{base}{p}"
         r = await HTTP.post(url, json=payload)
-        if r.status_code==200:
-            return r.json()
+        if r.status_code==200: return r.json()
     raise RuntimeError(f"POST failed for ['{base}{path}','{base}/api{path}','{base}/v1{path}']")
 
 def _mode_badge(chat_id:int)->str:
@@ -67,7 +64,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     STATE.setdefault(chat_id, {}).setdefault("net", "testnet")
     STATE.setdefault(chat_id, {}).setdefault("mode", BOT_MODE_DEFAULT)
-    net = STATE[chat_id]["net"]; badge = _mode_badge(chat_id)
+    net = STATE[chat_id]["net"]
+    badge = _mode_badge(chat_id)
     help_admin = "*/mint <to> <amount_wei>* (admin)\n*/send <to> <amount_wei>* (admin)" if STATE[chat_id]["mode"]=="admin" else ""
     await update.message.reply_text(
 f"""SLH Bot is up{badge}!
@@ -80,38 +78,29 @@ Group: {GROUP_INVITE_LINK}
 /balance <address>
 /estimate <mint|transfer> <to> <amount_wei>
 {help_admin}
-/mode user|admin – toggle (admins)
-/group – community link
-/stats – debug""", parse_mode="Markdown")
+/mode user|admin – toggle view (admin only)
+/group – show the community link
+/stats – debug info""", parse_mode="Markdown")
 
 async def group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 Join our community: {GROUP_INVITE_LINK}")
 
 async def use_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if not context.args:
-        return await update.message.reply_text("Usage: /use testnet|mainnet")
+    if not context.args: return await update.message.reply_text("Usage: /use testnet|mainnet")
     wanted = context.args[0].lower()
-    if wanted not in ("testnet","mainnet"):
-        return await update.message.reply_text("Network must be testnet|mainnet")
-    if wanted=="mainnet" and not MAINNET_API_BASE:
-        return await update.message.reply_text("Mainnet API not configured.")
+    if wanted not in ("testnet","mainnet"): return await update.message.reply_text("Network must be testnet|mainnet")
+    if wanted=="mainnet" and not MAINNET_API_BASE: return await update.message.reply_text("Mainnet API not configured.")
     STATE.setdefault(chat_id, {})["net"] = wanted
     await update.message.reply_text(f"Switched to *{wanted}*.", parse_mode="Markdown")
-
-def is_mode_admin(chat_id:int)->bool:
-    return STATE.get(chat_id,{}).get("mode",BOT_MODE_DEFAULT)=="admin"
 
 async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
-    if not context.args:
-        return await update.message.reply_text("Usage: /mode user|admin")
+    if not context.args: return await update.message.reply_text("Usage: /mode user|admin")
     wanted = context.args[0].lower()
-    if wanted not in ("user","admin"):
-        return await update.message.reply_text("Mode must be user|admin")
-    if wanted=="admin" and not is_admin(uid):
-        return await update.message.reply_text("❌ Admins only.")
+    if wanted not in ("user","admin"): return await update.message.reply_text("Mode must be user|admin")
+    if wanted=="admin" and not is_admin(uid): return await update.message.reply_text("❌ Admins only.")
     STATE.setdefault(chat_id, {})["mode"] = wanted
     await update.message.reply_text(f"Mode set to {wanted}{_mode_badge(chat_id)}")
 
@@ -131,11 +120,9 @@ async def tokeninfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if len(context.args)!=1:
-        return await update.message.reply_text("Usage: /balance <address>")
+    if len(context.args)!=1: return await update.message.reply_text("Usage: /balance <address>")
     addr = context.args[0]
-    if not _valid_addr(addr):
-        return await update.message.reply_text("❌ invalid address")
+    if not _valid_addr(addr): return await update.message.reply_text("❌ invalid address")
     try:
         data = await _get(f"/balance/{addr}", chat_id)
         ti = await _get("/tokeninfo", chat_id)
@@ -151,13 +138,10 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def estimate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if len(context.args)!=3:
-        return await update.message.reply_text("Usage: /estimate <mint|transfer> <to> <amount_wei>")
+    if len(context.args)!=3: return await update.message.reply_text("Usage: /estimate <mint|transfer> <to> <amount_wei>")
     op,to,amount = context.args
-    if op not in ("mint","transfer"):
-        return await update.message.reply_text("op must be mint|transfer")
-    if not _valid_addr(to):
-        return await update.message.reply_text("❌ invalid address")
+    if op not in ("mint","transfer"): return await update.message.reply_text("op must be mint|transfer")
+    if not _valid_addr(to): return await update.message.reply_text("❌ invalid address")
     try:
         data = await _get(f"/estimate/{op}?to={to}&amount={amount}", chat_id)
         gwei = Decimal(data["gasPriceWei"]) / Decimal(1_000_000_000)
@@ -171,10 +155,8 @@ async def estimate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def mint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id; uid = update.effective_user.id
-    if not is_admin(uid) or not is_mode_admin(chat_id):
-        return await update.message.reply_text("❌ Admins only (switch /mode admin).")
-    if len(context.args)!=2:
-        return await update.message.reply_text("Usage: /mint <to> <amount_wei>")
+    if uid not in ADMIN_IDS: return await update.message.reply_text("❌ Admins only.")
+    if len(context.args)!=2: return await update.message.reply_text("Usage: /mint <to> <amount_wei>")
     to,amount = context.args
     if not _valid_addr(to): return await update.message.reply_text("❌ invalid address")
     try:
@@ -187,10 +169,8 @@ async def mint(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id; uid = update.effective_user.id
-    if not is_admin(uid) or not is_mode_admin(chat_id):
-        return await update.message.reply_text("❌ Admins only (switch /mode admin).")
-    if len(context.args)!=2:
-        return await update.message.reply_text("Usage: /send <to> <amount_wei>")
+    if uid not in ADMIN_IDS: return await update.message.reply_text("❌ Admins only.")
+    if len(context.args)!=2: return await update.message.reply_text("Usage: /send <to> <amount_wei>")
     to,amount = context.args
     if not _valid_addr(to): return await update.message.reply_text("❌ invalid address")
     try:
