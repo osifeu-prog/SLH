@@ -24,3 +24,5 @@ Thumbs.db
 *.log
 *.sqlite3
 _backup_*/
+SLH.git/
+slh_API/app.py.bak_*
