@@ -14,6 +14,14 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 BSC_RPC_URL            = os.getenv("BSC_RPC_URL", "")
 CHAIN_ID               = int(os.getenv("CHAIN_ID", "0") or 0)
 SELA_TOKEN_ADDRESS = os.getenv("SELA_TOKEN_ADDRESS", "0xef633c34715a5A581741379c9D690628a1C82B74")
+# ==== FORCE_SELA_TOKEN_START ====
+try:
+    _desired = "0xef633c34715a5A581741379c9D690628a1C82B74"
+    if (not SELA_TOKEN_ADDRESS) or (str(SELA_TOKEN_ADDRESS).lower() != _desired.lower()):
+        SELA_TOKEN_ADDRESS = _desired
+except Exception:
+    SELA_TOKEN_ADDRESS = "0xef633c34715a5A581741379c9D690628a1C82B74"
+# ==== FORCE_SELA_TOKEN_END ====
 SELA_SYMBOL_OVERRIDE = os.getenv("SELA_SYMBOL_OVERRIDE")
 SELA_DECIMALS_OVERRIDE = os.getenv("SELA_DECIMALS_OVERRIDE")
 SELA_DECIMALS_OVERRIDE = int(SELA_DECIMALS_OVERRIDE) if SELA_DECIMALS_OVERRIDE else None
@@ -215,3 +223,69 @@ def estimate(op: str, to: str, amount: str):
 
 
 
+
+# ==== SAFE WRAPPERS START ====
+def _safe_token_info():
+    global token, token_decimals, token_symbol, SELA_TOKEN_ADDRESS, SELA_DECIMALS_OVERRIDE, SELA_SYMBOL_OVERRIDE
+    try:
+        name = str(token.functions.name().call()) if token else "SELA"
+    except Exception:
+        name = "SELA"
+    try:
+        sym = (SELA_SYMBOL_OVERRIDE or (str(token.functions.symbol().call()) if token else None)) or "SELA"
+    except Exception:
+        sym = (SELA_SYMBOL_OVERRIDE or "SELA")
+    try:
+        dec = (int(SELA_DECIMALS_OVERRIDE) if SELA_DECIMALS_OVERRIDE else (int(token.functions.decimals().call()) if token else None)) or 18
+    except Exception:
+        dec = int(SELA_DECIMALS_OVERRIDE) if SELA_DECIMALS_OVERRIDE else 18
+    return {
+        "name": name,
+        "symbol": sym,
+        "decimals": dec,
+        "address": Web3.to_checksum_address(SELA_TOKEN_ADDRESS) if SELA_TOKEN_ADDRESS else None,
+        "fallback": True
+    }
+
+try:
+    _orig_token_info = token_info
+    async def token_info():
+        try:
+            return await _orig_token_info()
+        except Exception:
+            return _safe_token_info()
+except NameError:
+    try:
+        _orig_tokeninfo = tokeninfo
+        def tokeninfo():
+            try:
+                return _orig_tokeninfo()
+            except Exception:
+                return _safe_token_info()
+    except NameError:
+        pass
+
+try:
+    _orig_token_balance = token_balance
+    async def token_balance(address: str):
+        try:
+            return await _orig_token_balance(address)
+        except Exception:
+            chk = Web3.to_checksum_address(address)
+            dec = int(SELA_DECIMALS_OVERRIDE) if SELA_DECIMALS_OVERRIDE else 18
+            sym = SELA_SYMBOL_OVERRIDE or "SELA"
+            return {"address": chk, "balance": "0", "decimals": dec, "symbol": sym, "fallback": True}
+except NameError:
+    try:
+        _orig_balance = balance
+        def balance(address: str):
+            try:
+                return _orig_balance(address)
+            except Exception:
+                chk = Web3.to_checksum_address(address)
+                dec = int(SELA_DECIMALS_OVERRIDE) if SELA_DECIMALS_OVERRIDE else 18
+                sym = SELA_SYMBOL_OVERRIDE or "SELA"
+                return {"address": chk, "balance": "0", "decimals": dec, "symbol": sym, "fallback": True}
+    except NameError:
+        pass
+# ==== SAFE WRAPPERS END ====
