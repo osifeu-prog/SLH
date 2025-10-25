@@ -1,179 +1,244 @@
-﻿import os
-from typing import Optional, List, Literal
-from fastapi import FastAPI, APIRouter, HTTPException, Query
-from pydantic import BaseModel
+﻿from __future__ import annotations
+import asyncio, logging, os
+from decimal import Decimal, getcontext, ROUND_DOWN
+from functools import lru_cache
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Query, status, APIRouter
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, BaseSettings, Field, validator
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
 
-# === ENV ===
-BSC_RPC_URL            = os.getenv("BSC_RPC_URL", "").strip()
-SELA_TOKEN_ADDRESS     = os.getenv("SELA_TOKEN_ADDRESS", "").strip()
-CHAIN_ID               = int(os.getenv("CHAIN_ID", "97"))  # 97=testnet, 56=mainnet
-TREASURY_PRIVATE_KEY   = os.getenv("TREASURY_PRIVATE_KEY", "").strip()
-TREASURY_ADDRESS       = os.getenv("TREASURY_ADDRESS", "").strip()
-SELA_SYMBOL_OVERRIDE   = os.getenv("SELA_SYMBOL_OVERRIDE", "").strip()
-SELA_DECIMALS_OVERRIDE = os.getenv("SELA_DECIMALS_OVERRIDE", "").strip()
-SELA_MINT_FUNCS        = os.getenv("SELA_MINT_FUNCS", "ownerMint,mintTo,mint").strip()
-GAS_PRICE_FLOOR_WEI    = int(os.getenv("GAS_PRICE_FLOOR_WEI", "0"))
+# high precision
+getcontext().prec = 78
+getcontext().rounding = ROUND_DOWN
 
-if not BSC_RPC_URL:        raise RuntimeError("BSC_RPC_URL missing")
-if not SELA_TOKEN_ADDRESS: raise RuntimeError("SELA_TOKEN_ADDRESS missing")
+class Settings(BaseSettings):
+    BSC_RPC_URL: str = Field(..., env="BSC_RPC_URL")
+    SELA_TOKEN_ADDRESS: str = Field(..., env="SELA_TOKEN_ADDRESS")
+    CHAIN_ID: int = Field(97, env="CHAIN_ID")
+    GAS_PRICE_FLOOR_WEI: int = Field(1_000_000_000, env="GAS_PRICE_FLOOR_WEI")
+    SELA_DECIMALS_OVERRIDE: Optional[int] = Field(None, env="SELA_DECIMALS_OVERRIDE")
+    SELA_SYMBOL_OVERRIDE: Optional[str] = Field(None, env="SELA_SYMBOL_OVERRIDE")
+    SELA_MINT_FUNCS: str = Field("ownerMint,mintTo,mint", env="SELA_MINT_FUNCS")
+    TREASURY_PRIVATE_KEY: Optional[str] = Field(None, env="TREASURY_PRIVATE_KEY")
+    TREASURY_ADDRESS: Optional[str] = Field(None, env="TREASURY_ADDRESS")
+    DRY_RUN: bool = Field(False, env="DRY_RUN")
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+    @validator("SELA_TOKEN_ADDRESS","TREASURY_ADDRESS", pre=True)
+    def _strip(cls, v): return v.strip() if isinstance(v,str) else v
 
-# === Web3 ===
-w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 30}))
-try:
-    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-except Exception:
-    pass
+settings = Settings()
 
-# Derive address when only PK provided
-if TREASURY_PRIVATE_KEY and not TREASURY_ADDRESS:
-    acct = w3.eth.account.from_key(TREASURY_PRIVATE_KEY)
-    TREASURY_ADDRESS = acct.address
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("slh_api")
 
-def _ck(addr: str) -> str:
+w3 = Web3(Web3.HTTPProvider(settings.BSC_RPC_URL))
+w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+if settings.TREASURY_PRIVATE_KEY and not settings.TREASURY_ADDRESS:
+    settings.TREASURY_ADDRESS = w3.eth.account.from_key(settings.TREASURY_PRIVATE_KEY).address
+    log.info("Derived TREASURY_ADDRESS from private key")
+
+ERC20_MIN_ABI = [
+    {"inputs":[],"name":"name","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"symbol","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"decimals","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"transfer","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"mint","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"mintTo","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"ownerMint","outputs":[],"stateMutability":"nonpayable","type":"function"}
+]
+TOKEN = w3.eth.contract(address=Web3.to_checksum_address(settings.SELA_TOKEN_ADDRESS), abi=ERC20_MIN_ABI)
+
+def to_checksum(addr: str) -> str:
     if not Web3.is_address(addr):
-        raise HTTPException(status_code=400, detail="invalid address")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid address")
     return Web3.to_checksum_address(addr)
 
-# === ERC20 minimal ABI (+ common mint names) ===
-ERC20_ABI = [
-    {"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"stateMutability":"view","type":"function"},
-    {"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"stateMutability":"view","type":"function"},
-    {"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
-    {"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"mint","outputs":[],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"mintTo","outputs":[],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"ownerMint","outputs":[],"stateMutability":"nonpayable","type":"function"},
-]
+@lru_cache(maxsize=8)
+def get_decimals() -> int:
+    if settings.SELA_DECIMALS_OVERRIDE is not None:
+        return int(settings.SELA_DECIMALS_OVERRIDE)
+    try:
+        return int(TOKEN.functions.decimals().call())
+    except Exception:
+        return 18
 
-def _contract():
-    return w3.eth.contract(address=_ck(SELA_TOKEN_ADDRESS), abi=ERC20_ABI)
+@lru_cache(maxsize=8)
+def get_symbol() -> str:
+    if settings.SELA_SYMBOL_OVERRIDE:
+        return settings.SELA_SYMBOL_OVERRIDE
+    try:
+        return TOKEN.functions.symbol().call()
+    except Exception:
+        return "TOKEN"
 
-def _mint_fn(contract, to_addr: str, amt: int):
-    names: List[str] = [n.strip() for n in SELA_MINT_FUNCS.split(",") if n.strip()]
-    names += ["mint", "mintTo", "ownerMint"]
-    for nm in names:
+def human_to_wei(amount_human: str) -> int:
+    d = Decimal(amount_human)
+    if d < 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="amount must be non-negative")
+    factor = Decimal(10) ** get_decimals()
+    return int((d * factor).to_integral_value(rounding=ROUND_DOWN))
+
+def wei_to_human(v: int) -> str:
+    factor = Decimal(10) ** get_decimals()
+    return str(Decimal(v) / factor)
+
+def _pick_gas_price(floor: int, override: Optional[int]) -> int:
+    try:
+        net = int(w3.eth.gas_price)
+    except Exception:
+        net = floor
+    if override and override > 0:
+        net = int(override)
+    return max(net, floor)
+
+_nonce_lock = asyncio.Lock()
+async def _next_nonce(address: str) -> int:
+    async with _nonce_lock:
+        return w3.eth.get_transaction_count(address, "pending")
+
+core = APIRouter()
+
+@core.get("/", response_class=PlainTextResponse)
+async def root():
+    return "SLH API up"
+
+@core.get("/healthz")
+async def healthz():
+    return {"ok": True, "chainId": settings.CHAIN_ID}
+
+@core.get("/tokeninfo")
+async def tokeninfo():
+    try:
+        name = TOKEN.functions.name().call()
+    except Exception:
+        name = None
+    sym = get_symbol()
+    dec = get_decimals()
+    try:
+        supply = TOKEN.functions.totalSupply().call()
+        supply_h = wei_to_human(supply)
+    except Exception:
+        supply_h = None
+    return {
+        "address": Web3.to_checksum_address(settings.SELA_TOKEN_ADDRESS),
+        "name": name,
+        "symbol": sym,
+        "decimals": dec,
+        "totalSupply": supply_h
+    }
+
+@core.get("/balance/{address}")
+async def balance(address: str):
+    addr = to_checksum(address)
+    try:
+        bal = TOKEN.functions.balanceOf(addr).call()
+    except Exception:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="balance fetch failed")
+    return {"address": addr, "balance": wei_to_human(bal)}
+
+@core.get("/estimate/{op}")
+async def estimate(op: str, to: str = Query(...), amount: str = Query(...), gasPriceWei: Optional[int] = Query(None)):
+    op = op.lower()
+    if op not in {"mint","transfer"}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="op must be mint|transfer")
+    to_addr = to_checksum(to)
+    amt = human_to_wei(amount)
+    try:
+        if op == "mint":
+            fn = None
+            for n in [x.strip() for x in settings.SELA_MINT_FUNCS.split(",") if x.strip()] + ["mint","mintTo","ownerMint"]:
+                try:
+                    fn = getattr(TOKEN.functions, n)(to_addr, amt)
+                    break
+                except Exception:
+                    continue
+            if fn is None:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="no mint function")
+            from_addr = settings.TREASURY_ADDRESS or to_addr
+        else:
+            if not settings.TREASURY_ADDRESS:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="TREASURY_ADDRESS not configured")
+            fn = TOKEN.functions.transfer(to_addr, amt)
+            from_addr = settings.TREASURY_ADDRESS
+        gas = fn.estimate_gas({"from": from_addr})
+        gp = _pick_gas_price(settings.GAS_PRICE_FLOOR_WEI, gasPriceWei)
+        return {"gas": int(gas), "gasPriceWei": int(gp), "totalWei": int(gas)*int(gp)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"estimate failed: {e}")
+
+async def _build_and_send(fn):
+    if settings.DRY_RUN:
+        log.info("DRY_RUN enabled; tx not broadcast")
+    priv = settings.TREASURY_PRIVATE_KEY
+    if not priv:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="TREASURY_PRIVATE_KEY not configured")
+    acct = w3.eth.account.from_key(priv)
+    nonce = await _next_nonce(acct.address)
+    try:
+        gas = fn.estimate_gas({"from": acct.address})
+    except Exception:
+        gas = 200_000
+    gp = _pick_gas_price(settings.GAS_PRICE_FLOOR_WEI, None)
+    tx = fn.build_transaction({"from": acct.address, "chainId": settings.CHAIN_ID, "nonce": nonce, "gas": int(gas), "gasPrice": int(gp)})
+    signed = w3.eth.account.sign_transaction(tx, priv)
+    if settings.DRY_RUN:
+        return {"txHash": None, "gas": int(gas), "gasPriceWei": int(gp), "rawTx": signed.rawTransaction.hex()}
+    h = w3.eth.send_raw_transaction(signed.rawTransaction)
+    return {"txHash": h.hex(), "gas": int(gas), "gasPriceWei": int(gp)}
+
+class TxIn(BaseModel):
+    to: str
+    amount: str
+    @validator("to")
+    def _addr(cls, v):
+        if not Web3.is_address(v):
+            raise ValueError("invalid address")
+        return Web3.to_checksum_address(v)
+
+@core.post("/mint")
+async def mint(inp: TxIn):
+    to_addr = inp.to
+    amt = human_to_wei(inp.amount)
+    fn = None
+    for n in [x.strip() for x in settings.SELA_MINT_FUNCS.split(",") if x.strip()] + ["mint","mintTo","ownerMint"]:
         try:
-            return getattr(contract.functions, nm)(to_addr, amt)
+            fn = getattr(TOKEN.functions, n)(to_addr, amt)
+            break
         except Exception:
             continue
-    raise HTTPException(status_code=400, detail="no mint function found on token contract")
+    if fn is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="no mint function")
+    return await _build_and_send(fn)
 
-def _min_gas_price(override: Optional[int]=None) -> int:
-    floor = max(GAS_PRICE_FLOOR_WEI, 0)
-    try:
-        cur = int(w3.eth.gas_price)
-    except Exception:
-        cur = floor
-    if override and override > 0:
-        cur = int(override)
-    return max(cur, floor)
+@core.post("/transfer")
+async def transfer(inp: TxIn):
+    if not settings.TREASURY_PRIVATE_KEY:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="TREASURY_PRIVATE_KEY not configured")
+    to_addr = inp.to
+    amt = human_to_wei(inp.amount)
+    fn = TOKEN.functions.transfer(to_addr, amt)
+    return await _build_and_send(fn)
 
-# === FastAPI ===
-app = FastAPI(title="SLH API", version="1.0.0")
-router = APIRouter()
+app = FastAPI(title="SLH API", version="1.0.2")
+# mount same routes under "", "/api", "/v1"
+for prefix in ("", "/api", "/v1"):
+    app.include_router(core, prefix=prefix)
 
-@router.get("/")
-def index():
-    return {"ok": True, "service": "slh_API", "chain_id": CHAIN_ID,
-            "routes": ["/healthz","/health","/tokeninfo",
-                       "/balance/{address}","/estimate/{op}","POST /mint","POST /transfer"]}
+@app.exception_handler(HTTPException)
+async def http_exc(_, exc: HTTPException):
+    return JSONResponse(exc.status_code, {"detail": exc.detail})
 
-@router.get("/healthz")
-@router.get("/health")
-def health():
-    return {"ok": bool(w3.is_connected()), "chain_id": CHAIN_ID}
-
-@router.get("/tokeninfo")
-def tokeninfo():
-    c = _contract()
-    try:
-        name = c.functions.name().call()
-        symbol = c.functions.symbol().call()
-        decimals = int(c.functions.decimals().call())
-        supply = int(c.functions.totalSupply().call())
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"onchain error: {e}")
-    if SELA_SYMBOL_OVERRIDE:
-        symbol = SELA_SYMBOL_OVERRIDE
-    if SELA_DECIMALS_OVERRIDE:
-        try: decimals = int(SELA_DECIMALS_OVERRIDE)
-        except Exception: pass
-    return {"address": _ck(SELA_TOKEN_ADDRESS), "name": name, "symbol": symbol,
-            "decimals": decimals, "totalSupply": str(supply), "chain_id": CHAIN_ID}
-
-@router.get("/balance/{address}")
-def balance(address: str):
-    c = _contract()
-    user = _ck(address)
-    try:
-        bal = int(c.functions.balanceOf(user).call())
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"onchain error: {e}")
-    return {"address": user, "balance": str(bal), "chain_id": CHAIN_ID}
-
-@router.get("/estimate/{op}")
-def estimate(op: Literal["mint","transfer"],
-             to: str = Query(...),
-             amount: str = Query(...),
-             gasPriceWei: Optional[int] = Query(None)):
-    c = _contract()
-    to_ck = _ck(to)
-    try:
-        amt = int(amount)
-    except Exception:
-        raise HTTPException(status_code=400, detail="amount must be integer (wei)")
-    if op == "mint":
-        fn = _mint_fn(c, to_ck, amt)
-        sender = TREASURY_ADDRESS or to_ck
-    else:
-        if not TREASURY_PRIVATE_KEY or not TREASURY_ADDRESS:
-            raise HTTPException(status_code=400, detail="transfer requires TREASURY_PRIVATE_KEY & TREASURY_ADDRESS")
-        fn = c.functions.transfer(to_ck, amt)
-        sender = TREASURY_ADDRESS
-    try:
-        tx = fn.build_transaction({"from": sender, "chainId": CHAIN_ID, "nonce": w3.eth.get_transaction_count(sender), "gasPrice": _min_gas_price(gasPriceWei)})
-        gas = int(w3.eth.estimate_gas(tx))
-        total = int(tx["gasPrice"]) * gas
-        return {"op": op, "to": to_ck, "amount": str(amt), "gas": gas, "gasPriceWei": int(tx["gasPrice"]), "totalWei": total, "chain_id": CHAIN_ID}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"estimate error: {e}")
-
-class TxBody(BaseModel):
-    to: str
-    amount: str  # wei
-
-def _send_tx(fn):
-    if not TREASURY_PRIVATE_KEY or not TREASURY_ADDRESS:
-        raise HTTPException(status_code=400, detail="missing TREASURY_PRIVATE_KEY / TREASURY_ADDRESS")
-    acct = w3.eth.account.from_key(TREASURY_PRIVATE_KEY)
-    nonce = w3.eth.get_transaction_count(acct.address, "pending")
-    tx = fn.build_transaction({"from": acct.address, "chainId": CHAIN_ID, "nonce": nonce, "gasPrice": _min_gas_price()})
-    gas = int(w3.eth.estimate_gas(tx))
-    tx["gas"] = gas
-    signed = acct.sign_transaction(tx)
-    txh = w3.eth.send_raw_transaction(signed.rawTransaction)
-    return {"txHash": txh.hex(), "gas": gas, "gasPriceWei": int(tx["gasPrice"]), "chain_id": CHAIN_ID}
-
-@router.post("/mint")
-def do_mint(body: TxBody):
-    c = _contract()
-    to_ck = _ck(body.to)
-    amt = int(body.amount)
-    fn = _mint_fn(c, to_ck, amt)
-    return _send_tx(fn)
-
-@router.post("/transfer")
-def do_transfer(body: TxBody):
-    c = _contract()
-    to_ck = _ck(body.to)
-    amt = int(body.amount)
-    return _send_tx(c.functions.transfer(to_ck, amt))
-
-# mount at root + /api + /v1 (to kill 404s in bot)
-app.include_router(router)
-app.include_router(router, prefix="/api")
-app.include_router(router, prefix="/v1")
+@app.exception_handler(Exception)
+async def generic_exc(_, exc: Exception):
+    logging.getLogger("slh_api").exception("Unhandled exception")
+    return JSONResponse(status.HTTP_500_INTERNAL_SERVER_ERROR, {"detail":"internal server error"})

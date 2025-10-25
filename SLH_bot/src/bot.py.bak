@@ -1,0 +1,231 @@
+﻿import os, re, logging
+from typing import Dict
+from decimal import Decimal
+import httpx
+from httpx import Timeout, Limits
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
+API_BASE = os.getenv("SLH_API_BASE","").rstrip("/")
+MAINNET_API_BASE = os.getenv("MAINNET_API_BASE","").rstrip("/")
+GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK","https://t.me/+HIzvM8sEgh1kNWY0").strip()
+LOG_LEVEL = os.getenv("LOG_LEVEL","INFO").upper()
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_CHAT_IDS","").split(",") if x.strip()]
+
+WEBHOOK_PUBLIC_BASE = os.getenv("BOT_WEBHOOK_PUBLIC_BASE","").rstrip("/")
+WEBHOOK_PATH = os.getenv("BOT_WEBHOOK_PATH","/webhook")
+WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET","")
+BOT_MODE_DEFAULT = os.getenv("BOT_MODE","user").lower()  # user|admin
+
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+log = logging.getLogger("slh.bot")
+
+if not TOKEN:    raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+if not API_BASE: raise RuntimeError("SLH_API_BASE missing")
+
+timeout = Timeout(30.0)
+limits = Limits(max_connections=100, max_keepalive_connections=20)
+HTTP = httpx.AsyncClient(timeout=timeout, limits=limits, headers={"User-Agent": "SLH-Telegram-Bot/2.4"})
+
+STATE: Dict[int, Dict[str,str]] = {}  # per chat: {"net": "testnet|mainnet", "mode": "user|admin"}
+
+def is_admin(user_id:int)->bool: return user_id in ADMIN_IDS
+
+def api_for(chat_id:int)->str:
+    net = STATE.get(chat_id,{}).get("net","testnet")
+    if net=="mainnet" and MAINNET_API_BASE:
+        return MAINNET_API_BASE
+    return API_BASE
+
+def _valid_addr(a: str) -> bool: return re.match(r"^0x[a-fA-F0-9]{40}$", a) is not None
+def _explorer(chain_id:int)->str: return "https://bscscan.com" if chain_id==56 else "https://testnet.bscscan.com"
+
+async def _get(path:str, chat_id:int):
+    base = api_for(chat_id)
+    for p in [path, f"/api{path}", f"/v1{path}"]:
+        url = f"{base}{p}"
+        r = await HTTP.get(url)
+        if r.status_code==200:
+            return r.json()
+    raise RuntimeError(f"GET failed for ['{base}{path}','{base}/api{path}','{base}/v1{path}']")
+
+async def _post(path:str, payload:dict, chat_id:int):
+    base = api_for(chat_id)
+    for p in [path, f"/api{path}", f"/v1{path}"]:
+        url = f"{base}{p}"
+        r = await HTTP.post(url, json=payload)
+        if r.status_code==200:
+            return r.json()
+    raise RuntimeError(f"POST failed for ['{base}{path}','{base}/api{path}','{base}/v1{path}']")
+
+def _mode_badge(chat_id:int)->str:
+    m = STATE.get(chat_id,{}).get("mode", BOT_MODE_DEFAULT)
+    return " (admin)" if m=="admin" else ""
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    STATE.setdefault(chat_id, {}).setdefault("net", "testnet")
+    STATE.setdefault(chat_id, {}).setdefault("mode", BOT_MODE_DEFAULT)
+    net = STATE[chat_id]["net"]; badge = _mode_badge(chat_id)
+    help_admin = "*/mint <to> <amount_wei>* (admin)\n*/send <to> <amount_wei>* (admin)" if STATE[chat_id]["mode"]=="admin" else ""
+    await update.message.reply_text(
+f"""SLH Bot is up{badge}!
+Current network: *{net}*
+Group: {GROUP_INVITE_LINK}
+/use testnet – switch to Testnet
+/use mainnet – switch to Mainnet
+
+/tokeninfo – contract stats
+/balance <address>
+/estimate <mint|transfer> <to> <amount_wei>
+{help_admin}
+/mode user|admin – toggle (admins)
+/group – community link
+/stats – debug""", parse_mode="Markdown")
+
+async def group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"👥 Join our community: {GROUP_INVITE_LINK}")
+
+async def use_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args:
+        return await update.message.reply_text("Usage: /use testnet|mainnet")
+    wanted = context.args[0].lower()
+    if wanted not in ("testnet","mainnet"):
+        return await update.message.reply_text("Network must be testnet|mainnet")
+    if wanted=="mainnet" and not MAINNET_API_BASE:
+        return await update.message.reply_text("Mainnet API not configured.")
+    STATE.setdefault(chat_id, {})["net"] = wanted
+    await update.message.reply_text(f"Switched to *{wanted}*.", parse_mode="Markdown")
+
+def is_mode_admin(chat_id:int)->bool:
+    return STATE.get(chat_id,{}).get("mode",BOT_MODE_DEFAULT)=="admin"
+
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    if not context.args:
+        return await update.message.reply_text("Usage: /mode user|admin")
+    wanted = context.args[0].lower()
+    if wanted not in ("user","admin"):
+        return await update.message.reply_text("Mode must be user|admin")
+    if wanted=="admin" and not is_admin(uid):
+        return await update.message.reply_text("❌ Admins only.")
+    STATE.setdefault(chat_id, {})["mode"] = wanted
+    await update.message.reply_text(f"Mode set to {wanted}{_mode_badge(chat_id)}")
+
+async def tokeninfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try:
+        data = await _get("/tokeninfo", chat_id)
+        chain_id = data.get("chain_id", 97)
+        msg = (f"📊 *Token Info*\n"
+               f"*Network:* {'Mainnet' if chain_id==56 else 'Testnet'} (chainId {chain_id})\n"
+               f"*Contract:* `{data.get('address')}`\n"
+               f"*Name:* {data.get('name')}  *Symbol:* {data.get('symbol')}  *Decimals:* {data.get('decimals')}\n"
+               f"*Total Supply:* {data.get('totalSupply')}")
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ tokeninfo failed: {e}")
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if len(context.args)!=1:
+        return await update.message.reply_text("Usage: /balance <address>")
+    addr = context.args[0]
+    if not _valid_addr(addr):
+        return await update.message.reply_text("❌ invalid address")
+    try:
+        data = await _get(f"/balance/{addr}", chat_id)
+        ti = await _get("/tokeninfo", chat_id)
+        dec = int(ti.get("decimals",18)); sym = ti.get("symbol","SLH")
+        wei = Decimal(data.get("balance","0"))
+        human = (wei / (Decimal(10) ** dec)).quantize(Decimal("0.000001"))
+        chain_id = data.get("chain_id",97)
+        await update.message.reply_text(
+            f"💰 *Balance*\n*Address:* `{data.get('address')}`\n*Amount:* {human} {sym}\n*Network:* {'Mainnet' if chain_id==56 else 'Testnet'}",
+            parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ balance failed: {e}")
+
+async def estimate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if len(context.args)!=3:
+        return await update.message.reply_text("Usage: /estimate <mint|transfer> <to> <amount_wei>")
+    op,to,amount = context.args
+    if op not in ("mint","transfer"):
+        return await update.message.reply_text("op must be mint|transfer")
+    if not _valid_addr(to):
+        return await update.message.reply_text("❌ invalid address")
+    try:
+        data = await _get(f"/estimate/{op}?to={to}&amount={amount}", chat_id)
+        gwei = Decimal(data["gasPriceWei"]) / Decimal(1_000_000_000)
+        total_bnb = Decimal(data["totalWei"]) / Decimal(1e18)
+        chain_id = data.get("chain_id",97)
+        await update.message.reply_text(
+            f"⚡ *Estimation ({op})*\nGas: {data['gas']}  |  GasPrice: {gwei:.2f} Gwei\nTotal Fee: {total_bnb:.8f} {'BNB' if chain_id==56 else 'tBNB'}",
+            parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ estimate failed: {e}")
+
+async def mint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id; uid = update.effective_user.id
+    if not is_admin(uid) or not is_mode_admin(chat_id):
+        return await update.message.reply_text("❌ Admins only (switch /mode admin).")
+    if len(context.args)!=2:
+        return await update.message.reply_text("Usage: /mint <to> <amount_wei>")
+    to,amount = context.args
+    if not _valid_addr(to): return await update.message.reply_text("❌ invalid address")
+    try:
+        data = await _post("/mint", {"to": to, "amount": amount}, chat_id)
+        chain_id = data.get("chain_id",97); h = data.get("txHash")
+        expl = _explorer(chain_id); link = f"{expl}/tx/{h}" if h else expl
+        await update.message.reply_text(f"✅ Mint sent.\nTx: `{h}`\n{link}", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ mint failed: {e}")
+
+async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id; uid = update.effective_user.id
+    if not is_admin(uid) or not is_mode_admin(chat_id):
+        return await update.message.reply_text("❌ Admins only (switch /mode admin).")
+    if len(context.args)!=2:
+        return await update.message.reply_text("Usage: /send <to> <amount_wei>")
+    to,amount = context.args
+    if not _valid_addr(to): return await update.message.reply_text("❌ invalid address")
+    try:
+        data = await _post("/transfer", {"to": to, "amount": amount}, chat_id)
+        chain_id = data.get("chain_id",97); h = data.get("txHash")
+        expl = _explorer(chain_id); link = f"{expl}/tx/{h}" if h else expl
+        await update.message.reply_text(f"✅ Transfer sent.\nTx: `{h}`\n{link}", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ send failed: {e}")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    net = STATE.get(chat_id,{}).get("net","testnet"); mode = STATE.get(chat_id,{}).get("mode",BOT_MODE_DEFAULT)
+    await update.message.reply_text(f"📈 Stats\nNet: {net}\nMode: {mode}\nAPI: {api_for(chat_id)}")
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("use", use_cmd))
+    app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("group", group_link))
+    app.add_handler(CommandHandler("tokeninfo", tokeninfo))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("estimate", estimate))
+    app.add_handler(CommandHandler("mint", mint))
+    app.add_handler(CommandHandler("send", send))
+    app.add_handler(CommandHandler("stats", stats))
+
+    if WEBHOOK_PUBLIC_BASE:
+        public = WEBHOOK_PUBLIC_BASE.rstrip("/")
+        route = WEBHOOK_PATH if WEBHOOK_PATH.startswith("/") else ("/"+WEBHOOK_PATH)
+        app.run_webhook(listen="0.0.0.0", port=int(os.getenv("PORT","8080")),
+                        webhook_url=f"{public}{route}", secret_token=(WEBHOOK_SECRET or None))
+    else:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
