@@ -1,145 +1,120 @@
-﻿import os, time, json, asyncio, httpx
-from dotenv import load_dotenv
+﻿import os
+import asyncio
+import json
+from typing import Optional
+import httpx
+from fastapi import FastAPI, Request
 
-# Load env file in same dir (Railway יזריק vars משלו)
-env_path = os.path.join(os.path.dirname(__file__), "bot.env")
-if os.path.exists(env_path):
-    load_dotenv(env_path)
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_MODE     = os.getenv("BOT_MODE", "polling").lower()   # polling | webhook
+TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SLH_API_BASE = os.getenv("SLH_API_BASE", "").rstrip("/")
-BOT_MODE = (os.getenv("BOT_MODE") or "polling").lower()
-ADMIN_IDS = [s.strip() for s in (os.getenv("ADMIN_CHAT_IDS") or "").split(",") if s.strip()]
-DEFAULT_WALLET = os.getenv("DEFAULT_WALLET") or ""
-SELA_AMOUNT = os.getenv("SELA_AMOUNT") or "3"
-LOG_LEVEL = os.getenv("LOG_LEVEL","INFO")
+ADMIN_IDS    = [s.strip() for s in (os.getenv("ADMIN_CHAT_IDS","") or "").split(",") if s.strip()]
+DEFAULT_WAL  = os.getenv("DEFAULT_WALLET")
 
-TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+# Webhook env
+WEBHOOK_BASE = os.getenv("BOT_WEBHOOK_PUBLIC_BASE","").rstrip("/")
+WEBHOOK_PATH = os.getenv("BOT_WEBHOOK_PATH","/tg")
+WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET")
 
-def log(msg): 
-    if LOG_LEVEL.upper() in ("INFO","DEBUG"): 
-        print(msg, flush=True)
-
-async def api_get(path):
-    async with httpx.AsyncClient(timeout=15) as cli:
-        r = await cli.get(f"{SLH_API_BASE}{path}")
-        r.raise_for_status()
-        return r.json()
-
-async def api_post(path, payload):
-    async with httpx.AsyncClient(timeout=30) as cli:
-        r = await cli.post(f"{SLH_API_BASE}{path}", json=payload)
-        r.raise_for_status()
-        return r.json()
-
-async def send_text(chat_id, text):
-    async with httpx.AsyncClient(timeout=15) as cli:
-        await cli.post(f"{TG}/sendMessage", json={"chat_id": chat_id, "text": text})
-
-def is_admin(chat_id:str) -> bool:
-    return (str(chat_id) in ADMIN_IDS) if ADMIN_IDS else False
+app = FastAPI(title="SLH Bot", version="1.0.0")
+client = httpx.AsyncClient(timeout=20)
 
 HELP = (
-    "SLH Bot is up!\n"
-    "/tokeninfo  contract stats\n"
-    f"/balance <address>\n"
-    f"/estimate <mint|transfer> <to> <amount>\n"
-    f"/mint <to> <amount> (owner)\n"
-    f"/send <to> <amount> (owner)\n"
+"/tokeninfo – contract stats\n"
+"/balance <address>\n"
+"/estimate <mint|transfer> <to> <amount>\n"
+"/mint <to> <amount> (owner)\n"
+"/send <to> <amount> (owner)"
 )
 
-async def handle_cmd(chat_id, text):
-    parts = text.strip().split()
-    cmd = parts[0].lower()
+async def tg_send(chat_id: int, text: str):
+    if not TOKEN: return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    await client.post(url, data={"chat_id": chat_id, "text": text})
 
-    try:
-        if cmd in ("/start","/help"):
-            await send_text(chat_id, HELP)
-        elif cmd == "/tokeninfo":
-            data = await api_get("/tokeninfo")
-            await send_text(chat_id, json.dumps(data, ensure_ascii=False))
-        elif cmd == "/balance":
-            if len(parts) < 2:
-                await send_text(chat_id, "Usage: /balance <address>")
-            else:
-                addr = parts[1]
-                data = await api_get(f"/balance/{addr}")
-                await send_text(chat_id, json.dumps(data))
-        elif cmd == "/estimate":
-            if len(parts) < 4:
-                await send_text(chat_id, "Usage: /estimate <mint|transfer> <to> <amount>")
-            else:
-                payload = {"kind": parts[1], "to": parts[2], "amount": parts[3]}
-                data = await api_post("/estimate", payload)
-                await send_text(chat_id, json.dumps(data))
-        elif cmd == "/mint":
-            if len(parts) < 3:
-                await send_text(chat_id, "Usage: /mint <to> <amount>")
-            elif not is_admin(chat_id):
-                await send_text(chat_id, "Unauthorized")
-            else:
-                payload = {"to": parts[1], "amount": parts[2]}
-                data = await api_post("/mint", payload)
-                await send_text(chat_id, json.dumps(data))
-        elif cmd == "/send":
-            if len(parts) < 3:
-                await send_text(chat_id, "Usage: /send <to> <amount>")
-            elif not is_admin(chat_id):
-                await send_text(chat_id, "Unauthorized")
-            else:
-                payload = {"to": parts[1], "amount": parts[2]}
-                data = await api_post("/send", payload)
-                await send_text(chat_id, json.dumps(data))
-        else:
-            await send_text(chat_id, "Unknown command. /help")
-    except httpx.HTTPStatusError as e:
-        await send_text(chat_id, f"API error: {e.response.status_code} {e.response.text}")
-    except Exception as e:
-        await send_text(chat_id, f"Error: {e}")
+async def api_get(path: str):
+    url = f"{SLH_API_BASE}{path}"
+    return await client.get(url)
 
+async def api_post(path: str, payload: dict):
+    url = f"{SLH_API_BASE}{path}"
+    return await client.post(url, json=payload)
+
+async def handle_cmd(chat_id: int, text: str):
+    t = (text or "").strip()
+    if t == "/start":
+        await tg_send(chat_id, "SLH Bot is up!\n"+HELP); return
+
+    if t.startswith("/tokeninfo"):
+        try:
+            r = await api_get("/tokeninfo")
+            await tg_send(chat_id, r.text if r.status_code==200 else f"❌ tokeninfo failed ({r.status_code})")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ tokeninfo failed: {e}")
+        return
+
+    if t.startswith("/balance"):
+        parts = t.split()
+        if len(parts) != 2:
+            await tg_send(chat_id, "Usage: /balance <address>"); return
+        try:
+            r = await api_get(f"/balance/{parts[1]}")
+            await tg_send(chat_id, r.text if r.status_code==200 else f"❌ balance failed ({r.status_code})")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ balance failed: {e}")
+        return
+
+    if t.startswith("/mint") or t.startswith("/send"):
+        parts = t.split()
+        if len(parts) != 3:
+            await tg_send(chat_id, f"Usage: {parts[0]} <to> <amount>"); return
+        cmd, to, amt = parts[0], parts[1], parts[2]
+        path = "/mint" if cmd=="/mint" else "/send"
+        try:
+            r = await api_post(path, {"to": to, "amount": int(amt)})
+            await tg_send(chat_id, r.text if r.status_code==200 else f"❌ {cmd[1:]} failed ({r.status_code})")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ {cmd[1:]} failed: {e}")
+        return
+
+    await tg_send(chat_id, "Unknown command.\n"+HELP)
+
+# -------- Polling --------
 async def polling_loop():
-    offset = None
+    if not TOKEN: return
+    last_update_id = 0
+    base = f"https://api.telegram.org/bot{TOKEN}"
     while True:
         try:
-            async with httpx.AsyncClient(timeout=60) as cli:
-                r = await cli.post(f"{TG}/getUpdates", json={"offset": offset, "timeout": 30})
-                updates = r.json().get("result", [])
-                for upd in updates:
-                    offset = upd["update_id"] + 1
-                    msg = upd.get("message") or upd.get("edited_message") or {}
-                    chat_id = msg.get("chat", {}).get("id")
-                    text = msg.get("text","")
-                    if chat_id and text:
-                        await handle_cmd(chat_id, text)
-        except Exception as e:
-            log(f"polling err: {e}")
+            r = await client.post(f"{base}/getUpdates", data={"timeout": 30, "offset": last_update_id+1})
+            j = r.json()
+            for upd in j.get("result",[]):
+                last_update_id = upd["update_id"]
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg: continue
+                chat_id = msg["chat"]["id"]
+                text = msg.get("text","")
+                await handle_cmd(chat_id, text)
+        except Exception:
             await asyncio.sleep(2)
 
-async def webhook_mode():
-    # רישום וובהוק פשוט (שרת חיצוני יקבל POST ויעביר ללוגים בלבד  מומלץ להישאר Polling בשלב זה)
-    public_base = os.getenv("BOT_WEBHOOK_PUBLIC_BASE")
-    path = os.getenv("BOT_WEBHOOK_PATH","/tg")
-    secret = os.getenv("BOT_WEBHOOK_SECRET","")
-    if not public_base:
-        log("BOT_WEBHOOK_PUBLIC_BASE not set; falling back to polling")
-        return await polling_loop()
+# -------- Webhook --------
+@app.post(WEBHOOK_PATH)
+async def webhook(request: Request):
+    if WEBHOOK_SECRET:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+            return {"ok":False}
+    upd = await request.json()
+    msg = upd.get("message") or upd.get("edited_message")
+    if msg:
+        chat_id = msg["chat"]["id"]; text = msg.get("text","")
+        await handle_cmd(chat_id, text)
+    return {"ok":True}
 
-    url = f"{public_base.rstrip('/')}{path}"
-    async with httpx.AsyncClient(timeout=15) as cli:
-        await cli.post(f"{TG}/setWebhook", json={"url": url, "secret_token": secret})
-    log(f"Webhook set to {url} (secret_token hidden)")
-    # כדי לא לסבך עם שרת HTTP נוסף פה — נשאר ב-idle
-    while True:
-        await asyncio.sleep(60)
-
-def main():
-    if not TELEGRAM_BOT_TOKEN or not SLH_API_BASE:
-        print("ENV missing: TELEGRAM_BOT_TOKEN or SLH_API_BASE", flush=True)
-        return
-    if BOT_MODE == "webhook":
-        asyncio.run(webhook_mode())
-    else:
-        asyncio.run(polling_loop())
+# -------- Entrypoint (for polling run) --------
+async def _main():
+    if BOT_MODE == "polling":
+        await polling_loop()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(_main())

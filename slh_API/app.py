@@ -1,153 +1,152 @@
-﻿from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+﻿import os
+from typing import List, Dict, Any
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import os
 from web3 import Web3
+from dotenv import load_dotenv
 
-app = FastAPI(title="SLH API", version="1.0.0")
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
-# --- ENV ---
-CHAIN_ID               = int(os.getenv("CHAIN_ID", "97"))               # default BSC testnet
+# ===== ENV =====
 BSC_RPC_URL            = os.getenv("BSC_RPC_URL", "")
+CHAIN_ID               = int(os.getenv("CHAIN_ID", "0") or 0)
 SELA_TOKEN_ADDRESS     = os.getenv("SELA_TOKEN_ADDRESS", "")
 SELA_SYMBOL_OVERRIDE   = os.getenv("SELA_SYMBOL_OVERRIDE")
 SELA_DECIMALS_OVERRIDE = os.getenv("SELA_DECIMALS_OVERRIDE")
-SELA_MINT_FUNCS        = os.getenv("SELA_MINT_FUNCS", "ownerOnly:mint")
-GAS_PRICE_FLOOR_WEI    = int(os.getenv("GAS_PRICE_FLOOR_WEI", "0") or 0)
+SELA_DECIMALS_OVERRIDE = int(SELA_DECIMALS_OVERRIDE) if SELA_DECIMALS_OVERRIDE else None
 
-TREASURY_PRIVATE_KEY   = os.getenv("TREASURY_PRIVATE_KEY", "")
-TREASURY_ADDRESS       = os.getenv("TREASURY_ADDRESS", "")
-
-# --- Web3 setup ---
+# ===== Web3 + Contract =====
 w3 = None
 token = None
+token_decimals = None
+token_symbol = None
 
-ERC20_MIN_ABI = [
-    {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
-    {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
-    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
-    {"constant": True, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
-    {"constant": True, "inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+ERC20_ABI = [
+  {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
+  {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
+  {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+  {"constant":True,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+  {"constant":True,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
 ]
 
-def _init_web3():
-    global w3, token
+def _mk_w3() -> Web3:
     if not BSC_RPC_URL:
-        return
-    w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 20}))
-    if SELA_TOKEN_ADDRESS and w3.is_address(SELA_TOKEN_ADDRESS):
-        token = w3.eth.contract(address=Web3.to_checksum_address(SELA_TOKEN_ADDRESS), abi=ERC20_MIN_ABI)
+        raise RuntimeError("BSC_RPC_URL env missing")
+    provider = Web3.HTTPProvider(BSC_RPC_URL, request_kwargs={"timeout": 20})
+    return Web3(provider)
 
-_init_web3()
+def _mk_token(w3: Web3):
+    if not SELA_TOKEN_ADDRESS:
+        return None
+    return w3.eth.contract(address=Web3.to_checksum_address(SELA_TOKEN_ADDRESS), abi=ERC20_ABI)
 
-def _decimals() -> int:
-    if SELA_DECIMALS_OVERRIDE:
-        try:
-            return int(SELA_DECIMALS_OVERRIDE)
-        except Exception:
-            pass
+app = FastAPI(title="SLH API", version="1.0.0")
+
+@app.on_event("startup")
+def _on_startup():
+    global w3, token, token_decimals, token_symbol
+    w3 = _mk_w3()
+    token = _mk_token(w3)
     if token:
         try:
-            return int(token.functions.decimals().call())
+            token_decimals = SELA_DECIMALS_OVERRIDE or int(token.functions.decimals().call())
         except Exception:
-            return 18
-    return 18
-
-def _symbol() -> str:
-    if SELA_SYMBOL_OVERRIDE:
-        return SELA_SYMBOL_OVERRIDE
-    if token:
+            token_decimals = SELA_DECIMALS_OVERRIDE or 18
         try:
-            return token.functions.symbol().call()
+            token_symbol = SELA_SYMBOL_OVERRIDE or str(token.functions.symbol().call())
         except Exception:
-            return "SELA"
-    return "SELA"
+            token_symbol = SELA_SYMBOL_OVERRIDE or "SELA"
 
-class EstimationRequest(BaseModel):
-    op: str
-    to: str
-    amount: Optional[str] = None
+def _have_rpc() -> bool:
+    try:
+        return bool(w3 and w3.is_connected())
+    except Exception:
+        return False
 
-class MintRequest(BaseModel):
-    to: str
-    amount: str
-
-class SendRequest(BaseModel):
-    to: str
-    amount: str
+def _human(amount_wei: int, decimals: int) -> float:
+    scale = 10 ** decimals
+    return float(amount_wei) / float(scale)
 
 @app.get("/healthz")
-def healthz():
+def healthz() -> Dict[str, Any]:
     return {
         "ok": True,
         "chain_id": CHAIN_ID,
-        "has_rpc": bool(BSC_RPC_URL),
-        "has_token": bool(SELA_TOKEN_ADDRESS),
-        "has_treasury": bool(TREASURY_PRIVATE_KEY and TREASURY_ADDRESS),
+        "has_rpc": _have_rpc(),
+        "has_token": bool(token),
+        "has_treasury": bool(os.getenv("TREASURY_PRIVATE_KEY") or os.getenv("TREASURY_ADDRESS")),
     }
 
 @app.get("/routes")
-def routes():
-    return sorted([{"path": r.path, "name": r.name} for r in app.router.routes], key=lambda x: x["path"])
+def routes() -> List[Dict[str, str]]:
+    items = []
+    for r in app.router.routes:
+        if hasattr(r, "path") and hasattr(r, "methods"):
+            items.append({"path": r.path, "methods": ",".join(sorted(r.methods))})
+    return items
 
 @app.get("/tokeninfo")
-def tokeninfo():
-    if not w3 or not token:
-        raise HTTPException(status_code=500, detail="RPC or token contract not initialized")
+def tokeninfo() -> Dict[str, Any]:
+    if not token:
+        raise HTTPException(status_code=500, detail="token contract not configured")
     try:
-        name = token.functions.name().call()
+        name = str(token.functions.name().call())
     except Exception:
-        name = "Unknown"
+        name = "SELA"
+    sym = token_symbol or "SELA"
+    dec = token_decimals or 18
     try:
-        symbol = _symbol()
+        total = int(token.functions.totalSupply().call())
     except Exception:
-        symbol = "SELA"
-    try:
-        decimals = _decimals()
-    except Exception:
-        decimals = 18
-    try:
-        total_supply = token.functions.totalSupply().call()
-    except Exception:
-        total_supply = 0
-
+        total = 0
     return {
-        "address": Web3.to_checksum_address(SELA_TOKEN_ADDRESS) if SELA_TOKEN_ADDRESS else None,
         "name": name,
-        "symbol": symbol,
-        "decimals": decimals,
-        "totalSupply": str(total_supply),
+        "symbol": sym,
+        "decimals": dec,
+        "totalSupply": total,
+        "totalHuman": _human(total, dec),
+        "address": Web3.to_checksum_address(SELA_TOKEN_ADDRESS),
         "chainId": CHAIN_ID,
     }
 
 @app.get("/balance/{address}")
-def balance(address: str):
-    if not w3:
-        raise HTTPException(status_code=500, detail="RPC not initialized")
-    if not w3.is_address(address):
-        raise HTTPException(status_code=400, detail="invalid address")
+def balance(address: str) -> Dict[str, Any]:
     if not token:
-        raise HTTPException(status_code=500, detail="token not initialized")
-
+        raise HTTPException(status_code=500, detail="token contract not configured")
     try:
-        raw = token.functions.balanceOf(Web3.to_checksum_address(address)).call()
-        return {"address": Web3.to_checksum_address(address), "raw": str(raw), "decimals": _decimals(), "symbol": _symbol()}
+        chk = Web3.to_checksum_address(address)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad address")
+    try:
+        bal = int(token.functions.balanceOf(chk).call())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"balance error: {e}")
+    dec = token_decimals or 18
+    return {
+        "address": chk,
+        "balance": bal,
+        "balanceHuman": _human(bal, dec),
+        "symbol": token_symbol or "SELA",
+        "decimals": dec,
+    }
 
-@app.post("/mint")
-def mint(body: MintRequest):
-    if not TREASURY_PRIVATE_KEY or not TREASURY_ADDRESS:
-        raise HTTPException(status_code=403, detail="mint disabled: missing treasury creds")
-    raise HTTPException(status_code=501, detail="mint not implemented yet in this minimal API")
+class EstimateOut(BaseModel):
+    op: str
+    to: str
+    amount: str
+    note: str
 
-@app.post("/send")
-def send(body: SendRequest):
-    if not TREASURY_PRIVATE_KEY or not TREASURY_ADDRESS:
-        raise HTTPException(status_code=403, detail="send disabled: missing treasury creds")
-    raise HTTPException(status_code=501, detail="send not implemented yet in this minimal API")
+@app.get("/estimate/{op}/{to}/{amount}", response_model=EstimateOut)
+def estimate(op: str, to: str, amount: str):
+    # שמים Placeholder עד שנחבר טרנזקציות בפועל
+    if op not in ("mint", "transfer"):
+        raise HTTPException(status_code=400, detail="op must be mint|transfer")
+    try:
+        _ = Web3.to_checksum_address(to)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad 'to' address")
+    return EstimateOut(op=op, to=to, amount=str(amount), note="gas estimation placeholder (to be implemented)")
 
-@app.post("/estimate")
-def estimate(body: EstimationRequest):
-    return JSONResponse({"op": body.op, "estimated": None, "note": "estimator stub"}, status_code=200)
