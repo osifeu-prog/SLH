@@ -1,5 +1,6 @@
-import os, asyncio, logging, httpx
+﻿import os, asyncio, logging, httpx
 from typing import Optional
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -16,16 +17,25 @@ def fmt(e: Exception)->str:
 async def _api_get(path: str):
     url = f"{API_BASE}{path}"
     async with httpx.AsyncClient(timeout=20) as cx:
-        r = await cx.get(url); r.raise_for_status(); return r.json()
+        r = await cx.get(url)
+        r.raise_for_status()
+        return r.json()
 
 async def _api_post(path: str, params: dict):
     url = f"{API_BASE}{path}"
     async with httpx.AsyncClient(timeout=40) as cx:
-        r = await cx.post(url, params=params); r.raise_for_status(); return r.json()
+        r = await cx.post(url, params=params)
+        r.raise_for_status()
+        return r.json()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "SLH Bot is up!\n/tokeninfo – contract stats\n/balance <address>\n/estimate <mint|transfer> <to> <amount>\n/mint <to> <amount> (owner)\n/send <to> <amount> (owner)"
+        "SLH Bot is up!\n"
+        "/tokeninfo – contract stats\n"
+        "/balance <address>\n"
+        "/estimate <mint|transfer> <to> <amount>\n"
+        "/mint <to> <amount> (owner)\n"
+        "/send <to> <amount> (owner)"
     )
 
 async def tokeninfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49,7 +59,9 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = context.args[0]
     try:
         data = await _api_get(f"/balance/{addr}")
-        await update.message.reply_text(f"Address: {data.get('address')}\nBalance: {data.get('balance')}")
+        await update.message.reply_text(
+            f"Address: {data.get('address')}\nBalance: {data.get('balance')}"
+        )
     except Exception as e:
         await update.message.reply_text(fmt(e))
 
@@ -58,8 +70,10 @@ async def estimate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /estimate <mint|transfer> <to> <amount>")
     op, to, amount = context.args
     try:
-        data = await _api_get(f\"/estimate/{op}/{to}/{amount}\")
-        await update.message.reply_text(f\"Op: {op}\nGas: {data.get('gas')}\nGasPrice: {data.get('gasPrice')}\")
+        data = await _api_get(f"/estimate/{op}/{to}/{amount}")
+        await update.message.reply_text(
+            f"Op: {op}\nGas: {data.get('gas')}\nGasPrice: {data.get('gasPrice')}"
+        )
     except Exception as e:
         await update.message.reply_text(fmt(e))
 
