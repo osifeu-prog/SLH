@@ -1,0 +1,2 @@
+﻿# SLH BOT (Polling)
+worker: python -m SLH_bot.main

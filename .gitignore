@@ -1,0 +1,26 @@
+﻿# --- Secrets / ENV ---
+.env
+*.env
+**/*.env
+slh_API/.env
+SLH_bot/bot.env
+SLH_bot/bot.webhook.env
+
+# --- Python ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+
+# --- OS/IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Logs/Artifacts ---
+*.log
+*.sqlite3
+_backup_*/
