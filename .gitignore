@@ -32,3 +32,13 @@ slh_API/app.py.bak_*
 **/*.env
 SLH_bot/bot.env
 SLH_bot/bot.webhook.env
+# secrets / env
+.env
+.env.*
+**/*.env
+SLH_bot/bot.env
+SLH_bot/bot.webhook.env
+
+# local backups
+SLH.git/
+slh_API/app.py.bak_*
