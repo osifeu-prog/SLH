@@ -1,2 +1,1 @@
-﻿# SLH BOT (Polling)
-worker: python -m SLH_bot.main
+﻿web: uvicorn SLH_bot.main:app --host 0.0.0.0 --port 8080
