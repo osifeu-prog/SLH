@@ -47,9 +47,12 @@ def _mk_w3() -> Web3:
     return Web3(provider)
 
 def _mk_token(w3: Web3):
-    if not SELA_TOKEN_ADDRESS:
-        return None
-    return w3.eth.contract(address=Web3.to_checksum_address(SELA_TOKEN_ADDRESS), abi=ERC20_ABI)
+    try:
+        if not SELA_TOKEN_ADDRESS:
+            return None
+        return w3.eth.contract(address=Web3.to_checksum_address(SELA_TOKEN_ADDRESS), abi=ERC20_ABI)
+    except Exception:
+        return None, abi=ERC20_ABI)
 
 app = FastAPI(title="SLH API", version="1.0.0")
 
@@ -289,3 +292,4 @@ except NameError:
     except NameError:
         pass
 # ==== SAFE WRAPPERS END ====
+
