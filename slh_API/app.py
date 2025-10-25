@@ -43,6 +43,69 @@ def _mk_token(w3: Web3):
 
 app = FastAPI(title="SLH API", version="1.0.0")
 
+
+# === [SLH PATCH] safe overrides & fallback ===
+import os
+from decimal import Decimal
+
+def _slh_overrides():
+    # קח מה-ENV אם קיים, אחרת ברירת מחדל בטוחה
+    sym = os.getenv("SELA_SYMBOL_OVERRIDE") or "SELA"
+    try:
+        dec = int(os.getenv("SELA_DECIMALS_OVERRIDE") or 18)
+    except Exception:
+        dec = 18
+    return sym, dec
+
+def _format_amount(amount_wei: int, decimals: int) -> str:
+    try:
+        q = Decimal(amount_wei) / (Decimal(10) ** Decimal(decimals))
+        # הסר אפסים מיותרים
+        s = format(q, 'f').rstrip('0').rstrip('.')
+        return s if s else "0"
+    except Exception:
+        return str(amount_wei)
+
+# עטיפה ל-token_info: נסה לקרוא מהחוזה; אם נכשל – החזר overrides.
+_orig_token_info = token_info
+async def token_info():
+    sym, dec = _slh_overrides()
+    try:
+        data = await _orig_token_info()
+        # אם ה-orig כבר עובד – החזר כרגיל
+        return data
+    except Exception as e:
+        return {
+            "ok": True,
+            "source": "override",
+            "symbol": sym,
+            "decimals": dec,
+            "note": f"metadata fallback: {type(e).__name__}"
+        }
+
+# עטיפה ל-token_balance: אם הקריאה או עיבוד המטאדטה נכשל – השתמש ב-overrides.
+_orig_token_balance = token_balance
+async def token_balance(address: str):
+    sym, dec = _slh_overrides()
+    try:
+        return await _orig_token_balance(address)
+    except Exception as e:
+        # ננסה משיכה ישירה של balanceOf כדי לתת תשובה שימושית
+        try:
+            bal_wei = contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
+        except Exception:
+            # אפילו balanceOf נכשל – זרוק שגיאה יעילה
+            return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502)
+        return {
+            "ok": True,
+            "source": "override",
+            "address": Web3.to_checksum_address(address),
+            "symbol": sym,
+            "decimals": dec,
+            "raw_wei": str(bal_wei),
+            "formatted": _format_amount(bal_wei, dec)
+        }
+# === [end SLH PATCH] ===
 @app.on_event("startup")
 def _on_startup():
     global w3, token, token_decimals, token_symbol
@@ -147,4 +210,5 @@ def estimate(op: str, to: str, amount: str):
     except Exception:
         raise HTTPException(status_code=400, detail="bad 'to' address")
     return EstimateOut(op=op, to=to, amount=str(amount), note="gas estimation placeholder (to be implemented)")
+
 
