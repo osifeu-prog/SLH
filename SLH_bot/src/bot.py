@@ -1,10 +1,23 @@
-﻿import os, asyncio, logging, httpx
+﻿# --- safe logging level parser (injected) ---
+import os as _os, logging as _logging
+def _slh_parse_level(val):
+    if val is None:
+        return _logging.INFO
+    try:
+        # מרשה גם ערך מספרי (10/20/30/40)
+        return int(val)
+    except Exception:
+        return getattr(_logging, str(val).upper(), _logging.INFO)
+# החלף basicConfig לשימוש בפונקציה הבטוחה
+_logging.basicConfig(level=_slh_parse_level(_os.getenv("LOG_LEVEL","INFO")))
+# --- end injection ---
+import os, asyncio, logging, httpx
 from typing import Optional
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+_logging.basicConfig(level=_slh_parse_level(_os.getenv("LOG_LEVEL","INFO")))
 log = logging.getLogger("slh.bot")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN","").strip()
