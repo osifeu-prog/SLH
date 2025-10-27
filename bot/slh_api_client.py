@@ -1,4 +1,4 @@
-import httpx, os
+﻿import httpx, os
 
 SLH_API_BASE = os.getenv("SLH_API_BASE", "https://slhapi-bot.up.railway.app")
 
@@ -22,3 +22,4 @@ async def healthz() -> dict:
             return r.json()
         except Exception:
             return {"ok": False, "error": r.text}
+
