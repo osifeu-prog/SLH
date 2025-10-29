@@ -1,25 +1,41 @@
-﻿import httpx, os
+import os, httpx, asyncio
+from typing import Optional
 
-SLH_API_BASE = os.getenv("SLH_API_BASE", "https://slhapi-bot.up.railway.app")
+API_BASE = os.getenv("SLH_API_BASE", "").rstrip("/")
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "").strip()
 
-async def transfer_slh(to_addr:str, amount_slh:str) -> dict:
-    url = f"{SLH_API_BASE}/transfer/slh"
-    payload = {"to_addr": to_addr, "amount_slh": amount_slh}
-    timeout = httpx.Timeout(20.0, connect=20.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, json=payload)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"ok": False, "error": f"http {r.status_code}: {r.text}"}
-        return data
+TIMEOUT = httpx.Timeout(10.0, read=20.0)
+_client: Optional[httpx.AsyncClient] = None
 
-async def healthz() -> dict:
-    url = f"{SLH_API_BASE}/healthz"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(url)
-        try:
-            return r.json()
-        except Exception:
-            return {"ok": False, "error": r.text}
+async def client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        headers = {}
+        if INTERNAL_API_KEY:
+            headers["X-Internal-Key"] = INTERNAL_API_KEY
+        _client = httpx.AsyncClient(base_url=API_BASE, timeout=TIMEOUT, headers=headers)
+    return _client
 
+async def healthz():
+    c = await client()
+    r = await c.get("/healthz")
+    r.raise_for_status()
+    return r.json()
+
+async def token_balance(address: str):
+    c = await client()
+    r = await c.get(f"/token/balance/{address}")
+    r.raise_for_status()
+    return r.json()
+
+async def transfer_slh(to_addr: str, amount_slh: str):
+    c = await client()
+    r = await c.post("/transfer/slh", json={"to_addr": to_addr, "amount_slh": amount_slh})
+    r.raise_for_status()
+    return r.json()
+
+async def aclose():
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None

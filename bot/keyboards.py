@@ -1,9 +1,8 @@
-from telegram import ReplyKeyboardMarkup
+from telegram import ReplyKeyboardMarkup, KeyboardButton
 
 def main_menu():
-    kb = [
-        ["💳 הזנת MetaMask", "📊 יתרה"],
-        ["💸 העברה", "🧱 בניית עסקה"],
-        ["ℹ️ עזרה"]
+    rows = [
+        [KeyboardButton("💳 Set Wallet"), KeyboardButton("📊 Balance")],
+        [KeyboardButton("💸 Send")]
     ]
-    return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)

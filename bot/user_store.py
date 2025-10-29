@@ -1,38 +1,41 @@
-import json, os, threading
-
-_lock = threading.Lock()
+import os, json, tempfile, asyncio
+from typing import Optional
 
 class UserStore:
-    def __init__(self, path:str):
+    def __init__(self, path: str = "data/users.json"):
         self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if not os.path.exists(self.path):
+            with open(self.path, "w", encoding="utf-8") as f:
                 json.dump({}, f)
+        self._lock = asyncio.Lock()
 
-    def _load(self):
-        with _lock:
-            with open(self.path, "r", encoding="utf-8") as f:
-                return json.load(f)
+    async def get_wallet(self, user_id: int) -> Optional[str]:
+        async with self._lock:
+            data = self._read()
+            return data.get(str(user_id), {}).get("wallet")
 
-    def _save(self, data):
-        with _lock:
-            tmp = self.path + ".tmp"
+    async def set_wallet(self, user_id: int, address: str):
+        async with self._lock:
+            data = self._read()
+            u = data.get(str(user_id), {})
+            u["wallet"] = address
+            data[str(user_id)] = u
+            self._write_atomic(data)
+
+    def _read(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _write_atomic(self, data: dict):
+        d = os.path.dirname(self.path) or "."
+        fd, tmp = tempfile.mkstemp(prefix="users.", suffix=".json", dir=d)
+        os.close(fd)
+        try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
-
-    def get_wallet(self, tg_id:str):
-        data = self._load()
-        u = data.get(str(tg_id), {})
-        return u.get("wallet")
-
-    def set_wallet(self, tg_id:str, addr:str):
-        data = self._load()
-        u = data.get(str(tg_id), {})
-        u["wallet"] = addr
-        data[str(tg_id)] = u
-        self._save(data)
-
-    def get_all(self):
-        return self._load()
+        finally:
+            if os.path.exists(tmp):
+                try: os.remove(tmp)
+                except: pass

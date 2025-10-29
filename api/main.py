@@ -1,114 +1,115 @@
-# FastAPI SLH Transfer API
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import Optional
-import os
-from web3 import Web3
+import os, json, math
 from decimal import Decimal
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Body, Header
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
 
-# ------- ENV -------
+load_dotenv()
+
 BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.binance.org")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "56"))
-SELA_TOKEN_ADDRESS = os.getenv("SELA_TOKEN_ADDRESS", "0xEf633c34715A5A581741379C9D690628A1C82B74")
-OPERATOR_PK = os.getenv("OPERATOR_PK", "").removeprefix("0x")
-GAS_PRICE_GWEI = int(os.getenv("GAS_PRICE_GWEI", "3"))
+SELA_TOKEN_ADDRESS = os.getenv("SELA_TOKEN_ADDRESS", "").strip()
+OPERATOR_PK = (os.getenv("OPERATOR_PK") or "").strip()
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "").strip()
+GAS_PRICE_GWEI = os.getenv("GAS_PRICE_GWEI", "").strip()
 GAS_LIMIT = int(os.getenv("GAS_LIMIT", "120000"))
 
-# ------- WEB3 -------
 w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL))
+# For BSC testnet/mainnet we sometimes need this middleware style for POA chains
+w3.middleware_onion.inject(geth_poa_middleware, layer=0)
 
-ERC20_ABI = [
-  {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
-  {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
-  {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
-  {"constant":True,"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
-  {"constant":False,"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}
-]
-token = w3.eth.contract(address=Web3.to_checksum_address(SELA_TOKEN_ADDRESS), abi=ERC20_ABI)
+if not w3.is_connected():
+    raise RuntimeError("Web3 provider is not connected. Check BSC_RPC_URL.")
 
-def _operator_address() -> str:
+# Load ERC20 ABI
+here = os.path.dirname(__file__)
+with open(os.path.join(here, "erc20_abi.json"), "r", encoding="utf-8") as f:
+    ERC20_ABI = json.load(f)
+
+def token_contract():
+    if not Web3.is_address(SELA_TOKEN_ADDRESS):
+        raise HTTPException(status_code=500, detail="SELA_TOKEN_ADDRESS is invalid or missing")
+    return w3.eth.contract(address=Web3.to_checksum_address(SELA_TOKEN_ADDRESS), abi=ERC20_ABI)
+
+def operator_address() -> Optional[str]:
     if not OPERATOR_PK:
-        raise RuntimeError("OPERATOR_PK is missing")
+        return None
     acct = w3.eth.account.from_key(OPERATOR_PK)
     return acct.address
 
-def _to_wei(amount_slh: str|float|int) -> int:
-    dec = token.functions.decimals().call()
-    q = Decimal(str(amount_slh))
-    return int(q * (Decimal(10) ** dec))
+class TransferIn(BaseModel):
+    to_addr: str = Field(..., description="Recipient address (0x...)")
+    amount_slh: Decimal = Field(..., gt=Decimal('0'), description="Amount of SLH in token units")
 
-class TransferRequest(BaseModel):
-    to_addr: str = Field(..., description="Recipient EVM address 0x...")
-    amount_slh: str = Field(..., description="Human amount, e.g., '0.1'")
-
-class TransferResponse(BaseModel):
-    ok: bool
-    tx_hash: Optional[str] = None
-    error: Optional[str] = None
-    network_mode: str = "mainnet"
-    chain_id: int = CHAIN_ID
-    token: str = SELA_TOKEN_ADDRESS
-
-app = FastAPI(title="SLH Transfer API", version="1.0.0")
+app = FastAPI(title="SLH API", version="1.0.0")
 
 @app.get("/healthz")
 def healthz():
-    try:
-        name = token.functions.name().call()
-        symbol = token.functions.symbol().call()
-        return {
-            "ok": True,
-            "network_mode": "mainnet" if CHAIN_ID == 56 else "testnet",
-            "chain_id": CHAIN_ID,
-            "token": SELA_TOKEN_ADDRESS,
-            "token_name": name,
-            "token_symbol": symbol
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "chain_id": CHAIN_ID,
+        "token_address": Web3.to_checksum_address(SELA_TOKEN_ADDRESS) if Web3.is_address(SELA_TOKEN_ADDRESS) else None,
+        "operator_address": operator_address(),
+        "rpc_ok": w3.is_connected(),
+    }
 
-@app.post("/transfer/slh", response_model=TransferResponse)
-def transfer_slh(req: TransferRequest):
-    from web3 import Web3
-    try:
-        # Basic validations
-        if not w3.is_address(req.to_addr):
-            raise HTTPException(status_code=400, detail="Invalid to_addr")
+@app.get("/token/balance/{address}")
+def token_balance(address: str):
+    if not Web3.is_address(address):
+        raise HTTPException(status_code=400, detail="invalid address")
+    c = token_contract()
+    bal = c.functions.balanceOf(Web3.to_checksum_address(address)).call()
+    decimals = c.functions.decimals().call()
+    human = Decimal(bal) / Decimal(10) ** Decimal(decimals)
+    return {"ok": True, "address": Web3.to_checksum_address(address), "balance": str(human), "decimals": decimals}
 
-        if not OPERATOR_PK:
-            raise HTTPException(status_code=500, detail="Operator key missing")
+@app.post("/transfer/slh")
+def transfer_slh(data: TransferIn, x_internal_key: Optional[str] = Header(None, convert_underscores=True)):
+    # Optional internal API key guard
+    if INTERNAL_API_KEY:
+        if not x_internal_key or x_internal_key != INTERNAL_API_KEY:
+            raise HTTPException(status_code=403, detail="forbidden")
 
-        sender = _operator_address()
-        to_checksum = Web3.to_checksum_address(req.to_addr)
+    if not OPERATOR_PK:
+        raise HTTPException(status_code=500, detail="server not configured (OPERATOR_PK missing)")
 
-        amount_wei = _to_wei(req.amount_slh)
-        if amount_wei <= 0:
-            raise HTTPException(status_code=400, detail="Invalid amount")
+    if not Web3.is_address(data.to_addr):
+        raise HTTPException(status_code=400, detail="invalid to_addr")
 
-        # Check operator balance
-        op_bal = token.functions.balanceOf(sender).call()
-        if op_bal < amount_wei:
-            raise HTTPException(status_code=402, detail="Operator has insufficient SLH balance")
+    c = token_contract()
 
-        # Build tx
-        nonce = w3.eth.get_transaction_count(sender)
-        tx = token.functions.transfer(to_checksum, amount_wei).build_transaction({
-            "from": sender,
-            "chainId": CHAIN_ID,
-            "nonce": nonce,
-            "gas": GAS_LIMIT,
-            "gasPrice": w3.to_wei(GAS_PRICE_GWEI, "gwei"),
-        })
+    decimals = c.functions.decimals().call()
+    amount_wei = int(Decimal(data.amount_slh) * (Decimal(10) ** Decimal(decimals)))
 
-        signed = w3.eth.account.sign_transaction(tx, private_key=OPERATOR_PK)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction).hex()
+    sender = w3.eth.account.from_key(OPERATOR_PK)
+    sender_addr = sender.address
 
-        return TransferResponse(ok=True, tx_hash=tx_hash)
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        return TransferResponse(ok=False, error=str(e))
+    # sanity: operator has token balance?
+    op_bal = c.functions.balanceOf(sender_addr).call()
+    if op_bal < amount_wei:
+        raise HTTPException(status_code=400, detail="insufficient token balance in operator")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # gas price
+    if GAS_PRICE_GWEI:
+        gp = int(Decimal(GAS_PRICE_GWEI) * (10 ** 9))
+    else:
+        gp = w3.eth.gas_price
+
+    nonce = w3.eth.get_transaction_count(sender_addr)
+
+    tx = c.functions.transfer(Web3.to_checksum_address(data.to_addr), amount_wei).build_transaction({
+        "chainId": CHAIN_ID,
+        "from": sender_addr,
+        "nonce": nonce,
+        "gas": GAS_LIMIT,
+        "gasPrice": gp,
+        "value": 0
+    })
+
+    signed = w3.eth.account.sign_transaction(tx, private_key=OPERATOR_PK)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction).hex()
+
+    return {"ok": True, "tx_hash": tx_hash, "from": sender_addr, "to": Web3.to_checksum_address(data.to_addr), "amount_slh": str(data.amount_slh)}

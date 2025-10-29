@@ -1,0 +1,22 @@
+services:
+  slh_api:
+    build: ./api
+    container_name: slh_api
+    env_file:
+      - ./.env
+      - ./api/.env
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  slh_bot:
+    build: ./bot
+    container_name: slh_bot
+    env_file:
+      - ./.env
+      - ./bot/.env
+    depends_on:
+      - slh_api
+    volumes:
+      - ./bot/data:/app/bot/data
+    restart: unless-stopped
