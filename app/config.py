@@ -1,18 +1,27 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import AnyUrl
+from functools import lru_cache
 
 
 class Settings(BaseSettings):
-    database_url: str = Field(..., alias="DATABASE_URL")
-    telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
-    base_url: str = Field("http://localhost:8000", alias="BASE_URL")
-    slh_token_address: str = Field(
-        "0xACb0A09414CEA1C879c67bB7A877E4e19480f022", alias="SLH_TOKEN_ADDRESS"
-    )
+    env: str = "production"
+    log_level: str = "INFO"
+
+    database_url: AnyUrl
+    telegram_bot_token: str
+
+    base_url: str | None = None
+    frontend_api_base: str | None = None
+    community_link: str | None = None
 
     class Config:
         env_file = ".env"
-        extra = "ignore"
+        env_file_encoding = "utf-8"
 
 
-settings = Settings()
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

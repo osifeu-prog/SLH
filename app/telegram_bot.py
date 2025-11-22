@@ -2,7 +2,8 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, Depends
+import aiohttp
+from fastapi import APIRouter, HTTPException, Request
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,13 +11,10 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-from sqlalchemy.orm import Session
 
 from .config import settings
-from .db import get_db
-from . import models
 
-logger = logging.getLogger("slh_wallet.bot")
+logger = logging.getLogger("slh.bot")
 
 router = APIRouter(tags=["telegram"])
 
@@ -36,9 +34,8 @@ async def _build_application() -> Application:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
-    app.add_handler(CommandHandler("set_bnb", cmd_set_bnb))
-    app.add_handler(CommandHandler("set_ton", cmd_set_ton))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("set_wallet", cmd_set_wallet))
+    app.add_handler(CommandHandler("balances", cmd_balances))
 
     return app
 
@@ -48,6 +45,7 @@ async def get_application() -> Application:
     if _application is None:
         _application = await _build_application()
         await _application.initialize()
+        logger.info("Telegram Application initialized.")
     return _application
 
 
@@ -56,40 +54,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user:
         return
 
-    base = settings.base_url
-
     text = (
         f"שלום @{user.username or user.id}! 🌐\n\n"
-        "ברוך הבא לארנק הקהילתי של SLH על רשת BNB.\n\n"
-        "כאן אתה יכול: \n"
-        "• לרשום את כתובת הארנק שלך ברשת BNB\n"
-        "• לרשום כתובת TON לקבלת SLH בטון\n"
-        "• לקבל קישור לאזור האישי שלך באתר\n\n"
-        "🔐 אין סיסמאות, אין התחברות – הזיהוי הוא דרך טלגרם + כתובות הארנק שלך.\n\n"
-        "הפקודות הזמינות:\n"
-        "/wallet – יצירת כרטיס משתמש וקבלת קישור אישי\n"
-        "/set_bnb <כתובת> – שמירת כתובת BNB שלך\n"
-        "/set_ton <כתובת> – שמירת כתובת TON שלך\n"
-        "/help – עזרה והסבר מלא\n\n"
-        f"אזור אישי יוצג בכתובת: {base}/u/{{telegram_id}}"
+        "ברוך הבא ל-SLH Community Wallet 🚀\n\n"
+        "פקודות זמינות:\n"
+        "/wallet - רישום/עדכון הארנק שלך\n"
+        "/balances - צפייה ביתרות (SLH פנימי + BNB/SLH ברשת)\n\n"
+        "המערכת אינה דורשת סיסמא – רק טלגרם + כתובות ארנק."
     )
 
     await update.effective_chat.send_message(text)
-
-
-async def _ensure_wallet_record(user, db: Session) -> models.Wallet:
-    wallet = db.get(models.Wallet, str(user.id))
-    if not wallet:
-        wallet = models.Wallet(
-            telegram_id=str(user.id),
-            username=user.username or "",
-            first_name=user.first_name or "",
-            last_name=user.last_name or "",
-        )
-        db.add(wallet)
-        db.commit()
-        db.refresh(wallet)
-    return wallet
 
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -97,114 +71,124 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not user:
         return
 
-    from .db import SessionLocal
-
-    db = SessionLocal()
-    try:
-        wallet = await _ensure_wallet_record(user, db)
-    finally:
-        db.close()
-
-    base = settings.base_url
-    hub_url = f"{base}/u/{user.id}"
-
     text = (
-        "📲 *הכרטיס הקהילתי שלך מוכן!*\n\n"
-        "המערכת מזהה אותך לפי טלגרם בלבד ושומרת רק את כתובות הארנק שלך.\n\n"
-        "כדי לעדכן כתובות:\n"
-        "`/set_bnb <כתובת_BNB>`\n"
-        "`/set_ton <כתובת_TON>`\n\n"
-        f"האזור האישי שלך באתר:\n{hub_url}\n\n"
-        "שם יוצגו כתובותיך, קישורים לחוזה SLH בביננס, ו־QR לשיתוף הכרטיס שלך.\n\n"
-        "_שימו לב: העברות SLH ו‑BNB מתבצעות בארנק החיצוני שלכם (MetaMask/Tonkeeper וכד'), "
-        "המערכת רק עוזרת לסנכרן ולשתף את הפרטים בקהילה._"
+        "📲 רישום / עדכון ארנק SLH\n\n"
+        "שלח לי את כתובת ה-BNB ואת כתובת ה-SLH שלך בפורמט הבא:\n"
+        "/set_wallet <כתובת_BNB> <כתובת_SLP/SLH_ב-BNB>\n\n"
+        "לדוגמה:\n"
+        "/set_wallet 0x1234...abcd 0xACb0A0..."
+    )
+    await update.effective_chat.send_message(text)
+
+
+async def cmd_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+
+    if len(context.args) != 2:
+        await update.effective_chat.send_message(
+            "שימוש: /set_wallet <כתובת_BNB> <כתובת_SLP/SLH_ב-BNB>"
+        )
+        return
+
+    bnb_address, slh_address = context.args
+    base = settings.base_url or "http://127.0.0.1:8000"
+    api_url = f"{base}/api/wallet/set"
+
+    payload = {
+        "bnb_address": bnb_address,
+        "slh_address": slh_address,
+    }
+
+    params = {
+        "telegram_id": str(user.id),
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, params=params, json=payload) as resp:
+                if resp.status != 200:
+                    logger.error("set_wallet API error %s", resp.status)
+                    await update.effective_chat.send_message(
+                        "❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר."
+                    )
+                    return
+
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error calling set_wallet API: %s", e)
+        await update.effective_chat.send_message(
+            "❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר."
+        )
+        return
+
+    await update.effective_chat.send_message(
+        "✅ הארנק שלך עודכן בהצלחה במערכת SLH."
     )
 
-    await update.effective_chat.send_message(text, parse_mode="Markdown")
 
-
-async def cmd_set_bnb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
 
-    if not context.args:
-        await update.effective_chat.send_message("שימוש: /set_bnb <כתובת_BNB>")
-        return
+    base = settings.base_url or "http://127.0.0.1:8000"
+    api_url = f"{base}/api/wallet/{user.id}/balances"
 
-    address = context.args[0].strip()
-    if not address.startswith("0x") or len(address) < 30:
-        await update.effective_chat.send_message("הכתובת לא נראית כמו כתובת BNB תקינה.")
-        return
-
-    from .db import SessionLocal
-
-    db = SessionLocal()
     try:
-        wallet = await _ensure_wallet_record(user, db)
-        wallet.bnb_address = address
-        db.commit()
-    finally:
-        db.close()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as resp:
+                if resp.status == 404:
+                    await update.effective_chat.send_message(
+                        "לא נמצא ארנק עבורך. השתמש ב-/wallet ו-/set_wallet קודם."
+                    )
+                    return
+                if resp.status != 200:
+                    logger.error("balances API error %s", resp.status)
+                    await update.effective_chat.send_message(
+                        "❌ בעיית תקשורת עם השרת. נסה שוב מאוחר יותר."
+                    )
+                    return
 
-    await update.effective_chat.send_message("✅ כתובת ה‑BNB שלך נשמרה בהצלחה.")
+                data = await resp.json()
 
-
-async def cmd_set_ton(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error calling balances API: %s", e)
+        await update.effective_chat.send_message(
+            "❌ בעיית תקשורת עם השרת. נסה שוב מאוחר יותר."
+        )
         return
 
-    if not context.args:
-        await update.effective_chat.send_message("שימוש: /set_ton <כתובת_TON>")
-        return
-
-    address = " ".join(context.args).strip()
-
-    from .db import SessionLocal
-
-    db = SessionLocal()
-    try:
-        wallet = await _ensure_wallet_record(user, db)
-        wallet.ton_address = address
-        db.commit()
-    finally:
-        db.close()
-
-    await update.effective_chat.send_message("✅ כתובת ה‑TON שלך נשמרה בהצלחה.")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "ℹ️ *מערכת הארנק הקהילתי של SLH*\n\n"
-        "1️⃣ תרשום את כתובת ה‑BNB שלך עם:/set_bnb\n"
-        "2️⃣ תרשום את כתובת ה‑TON שלך עם:/set_ton\n"
-        "3️⃣ קבל קישור לכרטיס האישי שלך עם:/wallet\n\n"
-        "העברות SLH נעשות דרך הארנק שלך על חוזה ה‑SLH ברשת BNB:\n"
-        f"`{settings.slh_token_address}`\n\n"
-        "מי שיש לו BNB יכול להחליף / לשלוח SLH בין חברי הקהילה באופן חופשי.\n"
-        "מי שאין לו – יקבל הסבר ורשימת ספקים חיצוניים לרכישת BNB/קריפטו (להוסיף בהמשך)."
+        "🏦 *יתרות הארנק שלך (Demo)*\n\n"
+        f"📍 כתובת BNB: `{data.get('bnb_address') or '-'}'\n"
+        f"📍 כתובת SLH: `{data.get('slh_address') or '-'}'\n\n"
+        f"💎 BNB: `{data.get('bnb_balance', 0):.6f}`\n"
+        f"🪙 SLH: `{data.get('slh_balance', 0):.2f}`\n\n"
+        "_(כרגע היתרות נשלפות מדמו – בהמשך נחבר ל-BscScan/TON)_"
     )
 
     await update.effective_chat.send_message(text, parse_mode="Markdown")
 
 
 @router.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    db: Session = Depends(get_db),  # reserved for future use
-) -> dict:
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty body")
-
+async def telegram_webhook(request: Request) -> dict:
     try:
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="Empty body")
+
         data = json.loads(body.decode("utf-8"))
+        app = await get_application()
+        update = Update.de_json(data, app.bot)
+        await app.process_update(update)
+
+        return {"ok": True}
     except json.JSONDecodeError:
+        logger.error("Invalid JSON in webhook")
         raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    app = await get_application()
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
-
-    return {"ok": True}
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error processing webhook: %s", e)
+        raise HTTPException(status_code=500, detail="Internal server error")

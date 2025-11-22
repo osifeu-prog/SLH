@@ -1,35 +1,24 @@
 import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .config import settings
 from .db import init_db
 from .routers import wallet as wallet_router
-from .telegram_bot import router as telegram_router
+from .telegram_bot import router as telegram_router, get_application
 
-
-# ---------------------------------------------------
-# Logging
-# ---------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
+logger = logging.getLogger("slh.main")
 
-
-# ---------------------------------------------------
-# FastAPI App
-# ---------------------------------------------------
 app = FastAPI(
     title="SLH Community Wallet",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    version="0.1.0",
 )
 
-
-# ---------------------------------------------------
-# CORS
-# ---------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,30 +27,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---------------------------------------------------
-# Startup
-# ---------------------------------------------------
-@app.on_event("startup")
-def on_startup():
-    """
-    יצירת טבלאות רק אם אין Alembic.
-    אם תפעיל Alembic – init_db לא מפריע.
-    """
-    init_db()
-    logging.info("Database initialized.")
-
-
-# ---------------------------------------------------
-# Health
-# ---------------------------------------------------
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-# ---------------------------------------------------
-# Routers
-# ---------------------------------------------------
 app.include_router(wallet_router.router)
 app.include_router(telegram_router)
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    init_db()
+    await get_application()
+    logger.info("Startup complete – DB + Telegram bot ready.")
+
+
+@app.get("/")
+async def index() -> dict:
+    return {
+        "ok": True,
+        "service": "SLH Community Wallet",
+        "env": settings.env,
+    }

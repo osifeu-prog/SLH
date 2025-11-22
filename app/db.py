@@ -1,46 +1,27 @@
+import logging
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
-
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from .config import settings
 
-
-# ---------------------------------------------------
-# SQLAlchemy Base Class
-# ---------------------------------------------------
-class Base(DeclarativeBase):
-    pass
-
-
-# ---------------------------------------------------
-# Engine – Railway PostgreSQL
-# ---------------------------------------------------
-# Railway נותנים connection string עם sslmode=require
-DATABASE_URL = settings.database_url
+logger = logging.getLogger("slh.db")
 
 engine = create_engine(
-    DATABASE_URL,
+    settings.database_url.unicode_string(),
+    pool_pre_ping=True,
     future=True,
-    pool_pre_ping=True,         # Handles dropped / idle connections
-    pool_size=5,
-    max_overflow=10,
 )
 
-
-# ---------------------------------------------------
-# Session Factory
-# ---------------------------------------------------
 SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
     autocommit=False,
-    expire_on_commit=False,
+    autoflush=False,
+    bind=engine,
+    future=True,
 )
 
+Base = declarative_base()
 
-# ---------------------------------------------------
-# Dependency: FastAPI get_db()
-# ---------------------------------------------------
-def get_db():
+
+def get_db() -> Session:
     db = SessionLocal()
     try:
         yield db
@@ -48,14 +29,7 @@ def get_db():
         db.close()
 
 
-# ---------------------------------------------------
-# init_db – Only for LOCAL usage, not for migrations
-# ---------------------------------------------------
-def init_db():
-    """
-    LOCAL ONLY:
-    יצירת טבלאות אוטומטית למי שלא משתמש ב־Alembic.
-    ב־Production אנחנו משתמשים Alembic.
-    """
-    from . import models  # noqa: F401 – ensures models are imported
+def init_db() -> None:
+    from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
+    logger.info("Database initialized.")
