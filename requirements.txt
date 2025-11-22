@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-python-telegram-bot==20.8
-SQLAlchemy>=2.0
-psycopg2-binary
-pydantic
-pydantic-settings
-Jinja2
