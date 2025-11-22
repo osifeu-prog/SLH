@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}SLH Community Wallet{% endblock %}
+{% block content %}
+<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+        <div>
+            <div class="tag">SLH · Community Wallet on BNB</div>
+            <h1 style="margin:0.75rem 0 0.4rem;font-size:1.5rem;">ברוכים הבאים לארנק הקהילה של SLH</h1>
+            <p class="muted">
+                המערכת הזו מחברת בין הבוט בטלגרם לבין חוזה ה‑SLH ברשת BNB.
+                אין סיסמאות, אין התחברות – הזיהוי הוא לפי טלגרם + כתובות הארנק שלכם.
+            </p>
+        </div>
+    </div>
+
+    <div class="section-title">איך מצטרפים</div>
+    <ol class="muted">
+        <li>פתחו את הבוט בטלגרם: <a href="https://t.me/Slh_selha_bot" target="_blank">@Slh_selha_bot</a></li>
+        <li>שלחו /start ולאחר מכן /wallet</li>
+        <li>רישמו את כתובת ה‑BNB שלכם עם: <span class="code">/set_bnb &lt;כתובת&gt;</span></li>
+        <li>אופציונלי: רישמו כתובת TON עם: <span class="code">/set_ton &lt;כתובת&gt;</span></li>
+        <li>הבוט יתן לכם קישור אישי לכרטיס שלכם במערכת</li>
+    </ol>
+
+    <div class="section-title">חוזה SLH על רשת BNB</div>
+    <p class="muted">
+        זה החוזה הרשמי של SLH ברשת BNB (Smart Chain).
+        דרכו מתבצעות העברות SLH בין הארנקים:
+    </p>
+    <p class="value code">{{ slh_token_address }}</p>
+    <p class="muted">
+        ניתן לצפות בחוזה דרך BscScan:
+        <a href="https://bscscan.com/token/{{ slh_token_address }}" target="_blank" rel="noreferrer">
+            פתיחה ב‑BscScan
+        </a>
+    </p>
+</div>
+{% endblock %}

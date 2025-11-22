@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="utf-8">
+    <title>{% block title %}SLH Wallet{% endblock %}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #050816;
+            color: #e5e7eb;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 1.5rem;
+        }
+        .card {
+            background: linear-gradient(135deg, #111827, #020617);
+            border-radius: 1.5rem;
+            padding: 1.5rem;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+        .tag {
+            display: inline-block;
+            padding: 0.2rem 0.6rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56,189,248,0.4);
+            color: #e0f2fe;
+        }
+        .muted {
+            color: #9ca3af;
+            font-size: 0.9rem;
+        }
+        a {
+            color: #38bdf8;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+        .col {
+            flex: 1 1 260px;
+        }
+        .label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #9ca3af;
+            margin-bottom: 0.25rem;
+        }
+        .value {
+            font-weight: 500;
+            word-break: break-all;
+        }
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(148,163,184,0.35);
+            font-size: 0.8rem;
+        }
+        .chip-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: #22c55e;
+        }
+        .section-title {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+            color: #6b7280;
+            margin-top: 1.75rem;
+            margin-bottom: 0.5rem;
+        }
+        .code {
+            font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            background: rgba(15,23,42,0.85);
+            padding: 0.2rem 0.4rem;
+            border-radius: 0.5rem;
+            font-size: 0.8rem;
+            border: 1px solid rgba(55,65,81,0.8);
+        }
+        .qr-box {
+            background: radial-gradient(circle at top, #1d283a, #020617);
+            border-radius: 1.25rem;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 1px dashed rgba(148,163,184,0.5);
+        }
+        .qr-img {
+            width: 160px;
+            height: 160px;
+            background: white;
+            border-radius: 0.75rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7rem;
+            color: #111827;
+            text-align: center;
+            padding: 0.5rem;
+        }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            background: rgba(30,64,175,0.4);
+            border: 1px solid rgba(129,140,248,0.6);
+            font-size: 0.8rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+</body>
+</html>

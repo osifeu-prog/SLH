@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}SLH · כרטיס משתמש{% endblock %}
+{% block content %}
+<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1.5rem;flex-wrap:wrap;">
+        <div class="col">
+            <div class="pill">
+                <span class="chip-dot"></span>
+                כרטיס משתמש SLH · BNB / TON
+            </div>
+            <h1 style="margin:0.75rem 0 0.25rem;font-size:1.4rem;">
+                {{ wallet.first_name or "משתמש" }} {{ wallet.last_name or "" }}
+            </h1>
+            <p class="muted" style="margin:0.1rem 0 0.4rem;">
+                Telegram ID: <span class="code">{{ wallet.telegram_id }}</span>
+                {% if wallet.username %}
+                    · @{{ wallet.username }}
+                {% endif %}
+            </p>
+
+            <div class="row" style="margin-top:1rem;">
+                <div class="col">
+                    <div class="label">כתובת BNB</div>
+                    <div class="value">
+                        {% if wallet.bnb_address %}
+                            <span class="code">{{ wallet.bnb_address }}</span>
+                            <div class="muted" style="margin-top:0.25rem;">
+                                ניתן להוסיף את הטוקן SLH לארנק החיצוני ולשלוח/לקבל SLH דרך החוזה:
+                            </div>
+                        {% else %}
+                            <span class="muted">עדיין לא הוגדרה כתובת BNB. עדכון דרך הבוט עם /set_bnb.</span>
+                        {% endif %}
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="label">כתובת TON</div>
+                    <div class="value">
+                        {% if wallet.ton_address %}
+                            <span class="code">{{ wallet.ton_address }}</span>
+                        {% else %}
+                            <span class="muted">עדיין לא הוגדרה כתובת TON. עדכון דרך הבוט עם /set_ton.</span>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-title">חוזה SLH ברשת BNB</div>
+            <div class="value">
+                <span class="code">{{ slh_token_address }}</span>
+                <div class="muted" style="margin-top:0.25rem;">
+                    להחלפת SLH, הוסיפו את הטוקן לארנק שלכם (MetaMask או דומה) באמצעות החוזה הזה.
+                </div>
+                <div style="margin-top:0.25rem;">
+                    <a href="https://bscscan.com/token/{{ slh_token_address }}" target="_blank" rel="noreferrer">
+                        צפייה בחוזה ב‑BscScan
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <div class="col">
+            <div class="qr-box">
+                <div class="label">קישור לשיתוף הכרטיס</div>
+                <div class="qr-img">
+                    /u/{{ wallet.telegram_id }}<br>
+                    בקובץ הסופי ניתן יהיה להחליף את זה ל‑QR אמיתי (באמצעות ספריית JS או API חיצוני).
+                </div>
+                <p class="muted" style="margin-top:0.75rem;text-align:center;">
+                    זהו הכרטיס הקהילתי שלך. ניתן לשתף את הקישור הבא עם חברים:<br>
+                    <span class="code">{{ base_url }}/u/{{ wallet.telegram_id }}</span>
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
