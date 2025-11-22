@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+
+  api:
+    build:
+      context: ../api-service
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      ENV: development
+      LOG_LEVEL: DEBUG
+      BASE_URL: http://localhost:8000
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  bot:
+    build:
+      context: ../bot-service
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      API_BASE_URL: http://api:8000
+    depends_on:
+      - api
+
+  frontend:
+    build:
+      context: ../web-frontend
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports:
+      - "3000:3000"
+    command: npm run dev
+    depends_on:
+      - api
