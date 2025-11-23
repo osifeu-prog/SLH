@@ -78,7 +78,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "ברוך הבא ל-SLH Community Wallet 🚀\n\n"
         "פקודות זמינות:\n"
         "/wallet - רישום/עדכון הארנק שלך\n"
-        "/balances - צפייה ביתרות (כרגע 0, בסיס לממשק עתידי)"
+        "/balances - צפייה ביתרות (חיבור חי ל-BNB/SLH ברשת BSC)\n"
         f"{community_part}"
     )
     await update.message.reply_text(text)
@@ -150,16 +150,22 @@ async def cmd_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to update wallet via API: %s", e)
-        if update.message:
-            await update.message.reply_text("❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר.")
+        await update.message.reply_text(
+            "❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר."
+        )
         return
 
-    if update.message:
-        await update.message.reply_text("✅ הארנק עודכן בהצלחה!")
+    # הודעת הצלחה עם פירוט הכתובות
+    ton_display = ton_address or "-"
+    await update.message.reply_text(
+        "✅ הארנק עודכן בהצלחה!\n\n"
+        f"BNB/SLH: {bnb_address}\n"
+        f"TON: {ton_display}"
+    )
 
 
 async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetch balances for the current user (placeholder, returns zeros)."""
+    """Fetch balances for the current user (live data from the API)."""
     user = update.effective_user
     if not user or not update.message:
         return
@@ -168,7 +174,7 @@ async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     url = f"{api_base}/api/wallet/{user.id}/balances"
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
@@ -177,12 +183,21 @@ async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("❌ לא הצלחתי למשוך יתרות כרגע. נסה שוב מאוחר יותר.")
         return
 
-    text = (
-        "📊 יתרות ארנק SLH (דמו):\n\n"
-        f"BNB: {data.get('bnb_balance', 0)} (כתובת: {data.get('bnb_address') or 'N/A'})\n"
-        f"SLH: {data.get('slh_balance', 0)} (כתובת: {data.get('slh_address') or 'N/A'})"
+    bnb_address = data.get("bnb_address") or "-"
+    ton_address = data.get("ton_address") or "-"
+    bnb_balance = data.get("bnb_balance", 0)
+    slh_balance = data.get("slh_balance", 0)
+
+    balances_text = (
+        "יתרות ארנק (חיבור חי לרשת BSC):\n\n"
+        f"BNB / SLH כתובת: {bnb_address}\n"
+        f"TON: {ton_address}\n\n"
+        f"BNB balance: {bnb_balance}\n"
+        f"SLH balance: {slh_balance}\n\n"
+        "הנתונים מחושבים בזמן אמת מ-BscScan עבור החוזה של SLH.\n"
     )
-    await update.message.reply_text(text)
+
+    await update.message.reply_text(balances_text)
 
 
 @router.post("/telegram/webhook")
