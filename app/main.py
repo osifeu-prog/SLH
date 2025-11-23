@@ -1,42 +1,37 @@
 import logging
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 
-from app.db import init_db
-from app.bot import get_application, handle_telegram_update
-from app.routers.wallet import router as wallet_router
+from fastapi import FastAPI
 
-logger = logging.getLogger("slh.main")
+from .config import settings
+from .db import init_db
+from .routers import wallet as wallet_router
+from . import telegram_webhook
 
-app = FastAPI(title="SLH Community Wallet")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 
-app.include_router(wallet_router, prefix="/api/wallet")
+app = FastAPI(title="SLH Community Wallet", version="0.1.0")
 
 
 @app.on_event("startup")
-async def startup_event():
-    logger.info("Initializing database...")
+async def on_startup() -> None:
     init_db()
-
-    logger.info("Initializing Telegram bot (webhook mode)...")
-    bot_app = get_application()
-    await bot_app.initialize()
-    logger.info("Startup complete – DB + Telegram bot ready.")
+    logging.getLogger("slh.main").info(
+        "Startup complete – DB ready, Telegram webhook endpoint mounted."
+    )
 
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    return await handle_telegram_update(data)
+app.include_router(wallet_router.router, prefix="/api/wallet", tags=["wallet"])
+app.include_router(telegram_webhook.router, prefix="/telegram", tags=["telegram"])
 
 
 @app.get("/")
-async def root():
-    return {"service": "SLH Community Wallet", "status": "ok"}
+async def index() -> dict:
+    return {"message": "SLH Community Wallet API is running"}
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok"}
