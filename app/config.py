@@ -1,6 +1,6 @@
-
 import os
 from functools import lru_cache
+
 
 class Settings:
     PROJECT_NAME: str = "SLH Community Wallet"
@@ -17,6 +17,17 @@ class Settings:
     # Other
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # כדי ש-main.py יוכל להשתמש settings.env
+    @property
+    def env(self) -> str:
+        return self.ENV
+
+
 @lru_cache
-def get_settings() -> Settings:
+def get_settings() -> "Settings":
     return Settings()
+
+
+# זה מה ש-main.py מצפה לו:
+# from .config import settings
+settings = get_settings()
