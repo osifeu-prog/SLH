@@ -2,6 +2,7 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.1
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.10
-httpx==0.28.1
+python-telegram-bot==21.5
+aiohttp==3.10.10
 pydantic==2.9.2
 pydantic-settings==2.6.1

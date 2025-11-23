@@ -1,32 +1,35 @@
 import logging
-
 from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
-
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from .config import settings
 
 logger = logging.getLogger("slh.db")
 
+engine = create_engine(
+    settings.database_url.unicode_string(),
+    pool_pre_ping=True,
+    future=True,
+)
 
-class Base(DeclarativeBase):
-    pass
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+    future=True,
+)
+
+Base = declarative_base()
 
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
-
-def init_db() -> None:
-    """Create all tables based on the SQLAlchemy models."""
-    from . import models  # noqa: F401  # import required so models are registered
-
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database initialized.")
-
-
-def get_db():
+def get_db() -> Session:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+def init_db() -> None:
+    from . import models  # noqa: F401
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database initialized.")
