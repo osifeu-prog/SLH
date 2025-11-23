@@ -1,7 +1,7 @@
 import os
 import json
 from functools import lru_cache
-from typing import List, Optional
+from typing import List
 
 
 class Settings:
@@ -24,7 +24,7 @@ class Settings:
     BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")
     ADMIN_LOG_CHAT_ID: str = os.getenv("ADMIN_LOG_CHAT_ID", "")
 
-    # Webhook base URL:
+    # Webhook base URL (שרת ה־web שלך – לדוגמה Railway)
     BASE_URL: str = os.getenv("BASE_URL", "").rstrip("/")
 
     # ============================
@@ -43,7 +43,13 @@ class Settings:
     SLH_TOKEN_DECIMALS: int = int(os.getenv("SLH_TOKEN_DECIMALS", "18"))
     SLH_TON_FACTOR: int = int(os.getenv("SLH_TON_FACTOR", "1000"))
 
-    # GLOBAL API BASE
+    # מחיר SLH קבוע בשקלים – "מספר ההצלחה"
+    SLH_ILS_PRICE: float = float(os.getenv("SLH_ILS_PRICE", "444.44"))
+
+    # ============================
+    #   Security / Misc
+    # ============================
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
     API_BASE_URL: str = os.getenv("API_BASE_URL", "")
 
     # ============================
@@ -56,7 +62,7 @@ class Settings:
 
     @property
     def PAYMENT_METHODS(self) -> List[str]:
-        """Parses the PAYMENT_METHODS JSON, with fallback."""
+        """פירוק PAYMENT_METHODS שמגיע כמחרוזת JSON."""
         try:
             return json.loads(self.PAYMENT_METHODS_RAW)
         except Exception:
@@ -68,12 +74,12 @@ class Settings:
 
     @property
     def env(self) -> str:
-        """Compatibility for code expecting settings.env."""
+        """שימוש ב-settings.env (כמו ב-main.py)."""
         return self.ENV
 
     @property
     def telegram_bot_token(self) -> str:
-        """Compatibility for code expecting settings.telegram_bot_token."""
+        """שימוש ב-settings.telegram_bot_token (כמו ב-telegram.py)."""
         return self.TELEGRAM_BOT_TOKEN
 
     @property
@@ -84,12 +90,17 @@ class Settings:
     def base_url(self) -> str:
         return self.BASE_URL
 
+    @property
+    def slh_ils_price(self) -> float:
+        """מחיר SLH בשקלים – ברירת מחדל: 444.44 ₪."""
+        return self.SLH_ILS_PRICE
+
 
 @lru_cache
 def get_settings() -> "Settings":
     return Settings()
 
 
-# This is imported everywhere across the app:
+# זה מה ששאר הקוד מייבא:
 # from app.config import settings
 settings = get_settings()
