@@ -12,7 +12,7 @@ class Wallet(Base):
     # מזהה טלגרם - primary key
     telegram_id = Column(String(64), primary_key=True, index=True)
 
-    # פרטים בסיסיים מהבוט
+    # פרטי משתמש מהבוט
     username = Column(String(255), nullable=True, index=True)
     first_name = Column(String(255), nullable=True)
     last_name = Column(String(255), nullable=True)
@@ -23,7 +23,7 @@ class Wallet(Base):
     # כתובת TON לאימות זהות
     ton_address = Column(String(255), nullable=True, index=True)
 
-    # כתובת SLH נפרדת (לפי דרישות עתידיות)
+    # כתובת SLH נפרדת (לעתיד, אבל קיימת בעמודות)
     slh_address = Column(String(255), nullable=True, index=True)
 
     # חותמות זמן

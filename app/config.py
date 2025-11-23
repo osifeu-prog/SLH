@@ -1,27 +1,14 @@
-from pydantic_settings import BaseSettings
-from pydantic import AnyUrl
-from functools import lru_cache
+import os
+from pydantic import BaseModel
 
 
-class Settings(BaseSettings):
-    env: str = "production"
-    log_level: str = "INFO"
-
-    database_url: AnyUrl
-    telegram_bot_token: str
-
-    base_url: str | None = None
-    frontend_api_base: str | None = None
-    community_link: str | None = None
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+class Settings(BaseModel):
+    env: str = os.getenv("ENV", "production")
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///./slh_wallet.db")
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    base_url: str = os.getenv("BASE_URL", "")  # e.g. https://web-production-xxxx.up.railway.app
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    admin_log_chat_id: str | None = os.getenv("ADMIN_LOG_CHAT_ID")
 
 
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
-
-settings = get_settings()
+settings = Settings()

@@ -1,35 +1,23 @@
-import logging
+from typing import Generator
+
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.orm import sessionmaker, Session
+
 from .config import settings
+from .models import Base
 
-logger = logging.getLogger("slh.db")
-
-engine = create_engine(
-    settings.database_url.unicode_string(),
-    pool_pre_ping=True,
-    future=True,
-)
-
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine,
-    future=True,
-)
-
-Base = declarative_base()
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def get_db() -> Session:
+def init_db() -> None:
+    # יוצר טבלאות אם הן לא קיימות
+    Base.metadata.create_all(bind=engine)
+
+
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-
-def init_db() -> None:
-    from . import models  # noqa: F401
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database initialized.")

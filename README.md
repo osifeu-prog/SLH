@@ -1,81 +1,55 @@
-# SLH Community Wallet – Monorepo (API + Bot + Frontend)
+# SLH Community Wallet (web + Telegram webhook)
 
-זהו שלד פרויקט מלא ל-SLH Wallet:
+שירות FastAPI פשוט שמנהל ארנקי קהילה (BNB/SLH + TON) ומתחבר לבוט טלגרם.
 
-- `api-service/` – FastAPI + PostgreSQL – אחראי על:
-  - רישום ארנקים לפי Telegram ID
-  - לוגיקת Ledger פנימית (SLH בין משתמשים)
-  - נקודות API שהבוט וה-Frontend משתמשים בהן
+## מבנה
 
-- `bot-service/` – בוט טלגרם (python-telegram-bot, polling)
-  - רישום/עדכון כתובות BNB/SLH דרך פקודות
-  - שליפת יתרות דרך ה-API
+- `app/main.py` — אפליקציית FastAPI, CORS, סטארטאפ, הגדרת Webhook לטלגרם
+- `app/models.py` — מודל SQLAlchemy לטבלת `wallets`
+- `app/db.py` — יצירת engine + Session + `init_db`
+- `app/schemas.py` — מודלי Pydantic ל-API
+- `app/wallet.py` — מסלולי API לניהול ארנקים + פונקציית `upsert_wallet`
+- `app/telegram.py` — מסלול `/telegram/webhook` שמקבל עדכוני טלגרם ומטפל בפקודות
+- `requirements.txt` — חבילות פייתון
+- `Dockerfile` — להרצה ב-Railway / Docker
 
-- `web-frontend/` – Next.js קליל
-  - דף נחיתה
-  - בדיקת ארנק לפי Telegram ID
+## משתני סביבה חשובים
 
-## הרצה על Railway (המלצה בסיסית)
+ב-Railway, בשירות `web`:
 
-### 1. שירות Postgres
+- `DATABASE_URL` — URL של PostgreSQL שריילווי נותן
+- `TELEGRAM_BOT_TOKEN` — טוקן של הבוט (SLH משקיעים)
+- `BASE_URL` — ה-URL של השירות, לדוגמה: `https://web-production-XXXX.up.railway.app`
+- `ENV` — אופציונלי, לדוגמה: `production`
+- `LOG_LEVEL` — `INFO` / `DEBUG` וכו'
+- `ADMIN_LOG_CHAT_ID` — אופציונלי, לא בשימוש כרגע
 
-צור Service מסוג Postgres בריילווי וקבל את ה-`DATABASE_URL`.
+## מסלולי API
 
-### 2. שירות API (`web` / `api-service`)
+- `GET /` — בדיקת חיים
+- `POST /api/wallet/set` — יצירה/עדכון ארנק
+- `GET /api/wallet/{telegram_id}` — שליפת ארנק
+- `GET /api/wallet/{telegram_id}/balances` — יתרות (כרגע 0, placeholder)
+- `POST /telegram/webhook` — Webhook של טלגרם
 
-1. צור Service חדש מ-GitHub ובחר את הריפו הזה.
-2. ב-Settings של השירות:
-   - Root Directory: `api-service`
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
-3. Variables:
-   - `DATABASE_URL` – מהשירות Postgres (דרך בחירת "Connect to Database")
-   - `ENV=production`
-   - `LOG_LEVEL=INFO`
-   - `BASE_URL=https://<your-api-subdomain>.up.railway.app`
-   - `FRONTEND_API_BASE` – אותו דבר כמו BASE_URL
-   - `SLH_TOKEN_ADDRESS=0xACb0A09414CEA1C879c67bB7A877E4e19480f022`
-   - `BSC_RPC_URL=https://bsc-dataseed.binance.org/`
-   - `SLH_TON_FACTOR=1000`
-   - `SECRET_KEY` – מחרוזת אקראית
+## פקודות בטלגרם
 
-4. (אופציונלי אך מומלץ) – הרצת Alembic:
-   - התחבר ל-`web` ב-Railway דרך Web Console או shell
-   - הרץ:
-     - `cd api-service`
-     - `alembic upgrade head`
+- `/start` — מסך ברוך הבא
+- `/wallet` — הסבר על רישום ארנק
+- `/set_wallet <BNB> [TON]` — שמירת כתובת ארנק
+- `/balances` — הצגת נתוני הארנק השמורים במערכת
 
-### 3. שירות Bot (`bot-service`)
+## פריסה לריילווי (Railway)
 
-1. צור Service חדש מאותו ריפו.
-2. Root Directory: `bot-service`
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `python -m bot.main`
-5. Variables:
-   - `TELEGRAM_BOT_TOKEN=...` – מה-BotFather
-   - `API_BASE_URL=https://<your-api-subdomain>.up.railway.app` (אותו של ה-API)
+1. ארוז את התיקייה הזו ל-ZIP והעלה לריפו ב-GitHub או ישירות ל-Railway.
+2. ודא שבשירות `web` ב-Railway:
+   - מוגדרים משתני הסביבה הנ"ל.
+   - מחובר ה-Postgres דרך `DATABASE_URL`.
+3. Railway יבנה לפי `Dockerfile` ויריץ את `uvicorn` על הפורט שהוגדר.
 
-> חשוב: עבור עבודה במצב polling אין צורך ב-webhook. ודא שה-webhook מבוטל:> `https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/deleteWebhook`
+לאחר שהשירות פעיל:
 
-### 4. שירות Frontend (`web-frontend`)
-
-1. צור Service חדש מאותו ריפו.
-2. Root Directory: `web-frontend`
-3. Build: `npm install && npm run build`
-4. Start: `npm start`
-5. Variables:
-   - `NEXT_PUBLIC_API_BASE=https://<your-api-subdomain>.up.railway.app`
-
-## שימוש בסיסי בבוט (אחרי שהכל רץ)
-
-- `/start` – קבלת הסבר קצר.
-- `/wallet` – קבלת הסבר על רישום ארנק.
-- `/set_wallet <BNB> [SLH]` – רישום כתובות (אם SLH חסר – משתמש בכתובת BNB).
-- `/balances` – שליפת יתרות בסיסית (כרגע מחזיר 0 – לשדרוג עתידי).
-
-## הערות המשך
-
-- כעת יש שלד נקי וברור שאפשר לפתח ממנו:
-  - הוספת סטייקינג (`/api/staking/...`)
-  - הוספת מסחר P2P (`/api/trade/...`)
-  - הרחבת ה-Frontend לעמוד פרופיל מלא, סטטוס סטייקינג וכו'.
+- פתח `https://YOUR_WEB_URL/` ותראה:
+  `{ "ok": true, "service": "SLH Community Wallet", "env": "production" }`
+- פתח `https://YOUR_WEB_URL/docs` כדי לבדוק את ה-API.
+- שלח `/start` לבוט בטלגרם — הוא ישתמש ב-webhook החדש.
