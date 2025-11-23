@@ -1,29 +1,23 @@
-from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, Field
+Osif Ungar, [23/11/2025 16:48]
+/wallet
 
+SLH, [23/11/2025 16:48]
+📲 רישום / עדכון ארנק SLH
 
-class WalletSetIn(BaseModel):
-    bnb_address: str = Field(..., description="User BNB address on BSC")
-    slh_address: str = Field(..., description="User SLH token address on BSC")
+שלח לי את כתובת ה-BNB ואת כתובת ה-SLH שלך בפורמט הבא:
+/set_wallet <כתובת_BNB> <כתובת_SLP/SLH_ב-BNB>
 
+לדוגמה:
+/set_wallet 0x1234...abcd 0xACb0A0...
 
-class WalletOut(BaseModel):
-    telegram_id: str
-    username: Optional[str] = None
-    first_name: Optional[str] = None
-    bnb_address: Optional[str] = None
-    slh_address: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+Osif Ungar, [23/11/2025 16:48]
+/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4
 
-    class Config:
-        from_attributes = True
+SLH, [23/11/2025 16:48]
+שימוש: /set_wallet <כתובת_BNB> <כתובת_SLP/SLH_ב-BNB>
 
+Osif Ungar, [23/11/2025 16:48]
+/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4 0xd0617b54fb4b6b66307846f217b4d685800e3da4
 
-class BalancesOut(BaseModel):
-    telegram_id: str
-    bnb_address: str | None = None
-    slh_address: str | None = None
-    bnb_balance: float = 0.0
-    slh_balance: float = 0.0
+SLH, [23/11/2025 16:48]
+❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר.
