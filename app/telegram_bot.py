@@ -63,6 +63,9 @@ def _api_base_url() -> str:
     return "http://localhost:8080"
 
 
+# ===== Commands =====
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Welcome message + basic help."""
     user = update.effective_user
@@ -78,7 +81,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "ברוך הבא ל-SLH Community Wallet 🚀\n\n"
         "פקודות זמינות:\n"
         "/wallet - רישום/עדכון הארנק שלך\n"
-        "/balances - צפייה ביתרות (חיבור חי לרשת BSC עבור BNB + SLH)"
+        "/balances - צפייה ביתרות (BNB + SLH מרשת BSC)\n"
         f"{community_part}"
     )
     await update.message.reply_text(text)
@@ -108,7 +111,7 @@ async def cmd_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user or not update.message:
         return
 
-    parts = update.message.text.strip().split()
+    parts = (update.message.text or "").strip().split()
     if len(parts) not in (2, 3):
         await update.message.reply_text(
             "שימוש: /set_wallet <כתובת_BNB>\n"
@@ -118,7 +121,7 @@ async def cmd_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if len(parts) == 2:
         _, bnb_address = parts
-        ton_address = None
+        ton_address: Optional[str] = None
     else:
         _, bnb_address, ton_address = parts
 
@@ -157,14 +160,18 @@ async def cmd_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if update.message:
-        await update.message.reply_text("✅ הארנק עודכן בהצלחה!")
+        ton_part = ton_address or "-"
+        await update.message.reply_text(
+            "✅ הארנק עודכן בהצלחה!\n\n"
+            f"BNB/SLH: {bnb_address}\n"
+            f"TON: {ton_part}"
+        )
 
 
 async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Fetch live balances for the current user from the API.
-
-    ה-API כבר מתחבר ל-BscScan ולחוזה של SLH ומחזיר יתרות אמיתיות.
+    Fetch live balances for the current user from our API
+    (which connects to BscScan + חוזה SLH).
     """
     user = update.effective_user
     if not user or not update.message:
@@ -174,25 +181,35 @@ async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     url = f"{api_base}/api/wallet/{user.id}/balances"
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to fetch balances from API: %s", e)
-        await update.message.reply_text("❌ לא הצלחתי למשוך יתרות כרגע. נסה שוב מאוחר יותר.")
+        await update.message.reply_text(
+            "❌ לא הצלחתי למשוך יתרות כרגע (BscScan / API). נסה שוב מאוחר יותר."
+        )
         return
+
+    bnb_address = data.get("bnb_address") or "-"
+    ton_address = data.get("ton_address") or "-"
+    bnb_balance = data.get("bnb_balance", 0)
+    slh_balance = data.get("slh_balance", 0)
 
     balances_text = (
         "יתרות ארנק (חיבור חי לרשת BSC):\n\n"
-        f"BNB / SLH כתובת: {data.get('bnb_address') or '-'}\n"
-        f"TON: {data.get('ton_address') or '-'}\n\n"
-        f"BNB balance: {data.get('bnb_balance', 0)}\n"
-        f"SLH balance: {data.get('slh_balance', 0)}\n\n"
+        f"BNB / SLH כתובת: {bnb_address}\n"
+        f"TON: {ton_address}\n\n"
+        f"BNB balance: {bnb_balance}\n"
+        f"SLH balance: {slh_balance}\n\n"
         "הנתונים מחושבים בזמן אמת מ-BscScan עבור החוזה של SLH.\n"
     )
 
     await update.message.reply_text(balances_text)
+
+
+# ===== Webhook =====
 
 
 @router.post("/telegram/webhook")
