@@ -1,294 +1,186 @@
-import asyncio
 import logging
 import os
-from datetime import datetime
-from decimal import Decimal
-from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from . import models, schemas
-from .db import get_db
-from .config import settings as app_settings
+from app import models, schemas  # שים לב: לא from . import ...
+
+from app.db import get_db
 
 logger = logging.getLogger("slh.wallet")
 
 router = APIRouter(prefix="/api/wallet", tags=["wallet"])
 
 
-# --------- CONFIG ---------
-
-
-def get_config() -> SimpleNamespace:
-    """
-    קורא את הגדרות האפליקציה + משתני סביבה רלוונטיים ל-BSC/SLH.
-    """
-    return SimpleNamespace(
-        ENV=app_settings.env,
-        DATABASE_URL=app_settings.database_url,
-        TELEGRAM_BOT_TOKEN=app_settings.telegram_bot_token,
-        BASE_URL=app_settings.base_url,
-        LOG_LEVEL=app_settings.log_level,
-        ADMIN_LOG_CHAT_ID=app_settings.admin_log_chat_id,
-        # BSC / SLH
-        BSC_RPC_URL=os.getenv(
-            "BSC_RPC_URL", "https://bsc-dataseed.binance.org/"
-        ),
-        BSCSCAN_API_KEY=os.getenv("BSCSCAN_API_KEY"),
-        SLH_TOKEN_ADDRESS=os.getenv("SLH_TOKEN_ADDRESS"),
-        SLH_TOKEN_DECIMALS=int(os.getenv("SLH_TOKEN_DECIMALS") or "18"),
-    )
-
-
-config = get_config()
+# ===== Helpers for BscScan =====
 
 BSCSCAN_API_URL = "https://api.bscscan.com/api"
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY") or ""
+SLH_TOKEN_ADDRESS = os.getenv("SLH_TOKEN_ADDRESS") or ""
+# דיפולט 18 אם לא הוגדר, אצלך הגדרת 15
+try:
+    SLH_TOKEN_DECIMALS = int(os.getenv("SLH_TOKEN_DECIMALS", "18"))
+except ValueError:
+    SLH_TOKEN_DECIMALS = 18
 
 
-# --------- HELPERS: DB ---------
-
-
-def upsert_wallet(
-    db: Session,
-    telegram_id: str,
-    username: Optional[str],
-    first_name: Optional[str],
-    bnb_address: str,
-    ton_address: Optional[str] = None,
-) -> models.Wallet:
-    """
-    יוצר או מעדכן רשומת ארנק לפי telegram_id.
-    slh_address = bnb_address (כפי שהחלטנו – אותו ארנק ל-BNB ול-SLH).
-    """
-    wallet: Optional[models.Wallet] = db.get(models.Wallet, telegram_id)
-
-    if wallet is None:
-        wallet = models.Wallet(
-            telegram_id=telegram_id,
-            username=username,
-            first_name=first_name,
-            last_name=None,
-            bnb_address=bnb_address,
-            ton_address=ton_address,
-            slh_address=bnb_address,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        db.add(wallet)
-        logger.info(
-            "Created new wallet: telegram_id=%s bnb=%s ton=%s",
-            telegram_id,
-            bnb_address,
-            ton_address,
-        )
-    else:
-        wallet.username = username or wallet.username
-        wallet.first_name = first_name or wallet.first_name
-        wallet.bnb_address = bnb_address
-        wallet.slh_address = bnb_address
-        wallet.ton_address = ton_address or wallet.ton_address
-        wallet.updated_at = datetime.utcnow()
-        logger.info(
-            "Updated wallet: telegram_id=%s bnb=%s ton=%s",
-            telegram_id,
-            bnb_address,
-            ton_address,
-        )
-
-    db.commit()
-    db.refresh(wallet)
-    return wallet
-
-
-# --------- HELPERS: BSC / BscScan ---------
-
-
-async def _fetch_bnb_balance(address: str) -> Decimal:
-    """
-    מחזיר יתרת BNB אמיתית מ-BscScan (ביחידות BNB, לא wei).
-    """
-    if not config.BSCSCAN_API_KEY:
-        logger.warning("BSCSCAN_API_KEY not configured – returning 0 BNB")
-        return Decimal(0)
-
-    params = {
-        "module": "account",
-        "action": "balance",
-        "address": address,
-        "apikey": config.BSCSCAN_API_KEY,
-    }
-
+def _normalize_decimal(value_str: str, decimals: int) -> float:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(BSCSCAN_API_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        logger.exception("Failed to fetch BNB balance from BscScan: %s", exc)
-        return Decimal(0)
-
-    if data.get("status") != "1":
-        logger.warning("BscScan BNB balance error: %s", data)
-        return Decimal(0)
-
-    # result is in wei
-    wei_str = data.get("result", "0")
-    try:
-        wei = Decimal(wei_str)
+        raw = int(value_str)
+        return raw / (10 ** decimals)
     except Exception:
-        logger.warning("Invalid wei value from BscScan: %s", wei_str)
-        return Decimal(0)
-
-    # 1 BNB = 1e18 wei
-    return wei / Decimal("1e18")
+        return 0.0
 
 
-async def _fetch_slh_balance(address: str) -> Decimal:
+def _fetch_bnb_and_slh_balances(address: str) -> Tuple[float, float]:
     """
-    מחזיר יתרת טוקן SLH (BEP-20) לפי החוזה שסיפקת, דרך BscScan.
+    מושך יתרות מ-BscScan:
+    - BNB native (18 decimals)
+    - SLH token לפי החוזה שהוגדר ב-SLH_TOKEN_ADDRESS
     """
-    if not config.BSCSCAN_API_KEY or not config.SLH_TOKEN_ADDRESS:
+    if not BSCSCAN_API_KEY or not SLH_TOKEN_ADDRESS:
         logger.warning(
-            "BSCSCAN_API_KEY or SLH_TOKEN_ADDRESS not configured – returning 0 SLH"
+            "BscScan disabled: BSCSCAN_API_KEY or SLH_TOKEN_ADDRESS not configured."
         )
-        return Decimal(0)
+        return 0.0, 0.0
 
-    params = {
-        "module": "account",
-        "action": "tokenbalance",
-        "contractaddress": config.SLH_TOKEN_ADDRESS,
-        "address": address,
-        "tag": "latest",
-        "apikey": config.BSCSCAN_API_KEY,
-    }
+    bnb_balance = 0.0
+    slh_balance = 0.0
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(BSCSCAN_API_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        logger.exception("Failed to fetch SLH balance from BscScan: %s", exc)
-        return Decimal(0)
+        # --- BNB balance ---
+        params_bnb = {
+            "module": "account",
+            "action": "balance",
+            "address": address,
+            "apikey": BSCSCAN_API_KEY,
+        }
+        with httpx.Client(timeout=10) as client:
+            resp_bnb = client.get(BSCSCAN_API_URL, params=params_bnb)
+        resp_bnb.raise_for_status()
+        data_bnb = resp_bnb.json()
+        if data_bnb.get("status") == "1":
+            bnb_balance = _normalize_decimal(data_bnb.get("result", "0"), 18)
+        else:
+            logger.warning("BscScan BNB response NOTOK: %s", data_bnb)
 
-    if data.get("status") not in ("1", 1, None):
-        # יש קריאות שבמצב "success" מחזירות status="0" אבל עם result, לכן לא נחנוק חזק מדי
-        logger.warning("BscScan SLH balance warning: %s", data)
+        # --- SLH token balance ---
+        params_slh = {
+            "module": "account",
+            "action": "tokenbalance",
+            "contractaddress": SLH_TOKEN_ADDRESS,
+            "address": address,
+            "tag": "latest",
+            "apikey": BSCSCAN_API_KEY,
+        }
+        with httpx.Client(timeout=10) as client:
+            resp_slh = client.get(BSCSCAN_API_URL, params=params_slh)
+        resp_slh.raise_for_status()
+        data_slh = resp_slh.json()
+        if data_slh.get("status") == "1":
+            slh_balance = _normalize_decimal(
+                data_slh.get("result", "0"), SLH_TOKEN_DECIMALS
+            )
+        else:
+            logger.warning("BscScan SLH response NOTOK: %s", data_slh)
 
-    raw_str = data.get("result", "0")
-    try:
-        raw = Decimal(raw_str)
-    except Exception:
-        logger.warning("Invalid SLH raw balance value: %s", raw_str)
-        return Decimal(0)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Error fetching balances from BscScan: %s", e)
 
-    decimals = int(config.SLH_TOKEN_DECIMALS or 18)
-    factor = Decimal(10) ** Decimal(decimals)
-    if factor == 0:
-        return Decimal(0)
-
-    return raw / factor
-
-
-async def get_balances_live(wallet: models.Wallet) -> schemas.BalancesOut:
-    """
-    מחזיר BalancesOut עם נתונים חיים מ-BscScan.
-    כרגע TON נשאר 0 / לא מחושב – אפשר להרחיב בהמשך.
-    """
-    if not wallet.bnb_address:
-        return schemas.BalancesOut(
-            telegram_id=wallet.telegram_id,
-            bnb_address=None,
-            ton_address=wallet.ton_address,
-            slh_address=None,
-            bnb_balance=0.0,
-            slh_balance=0.0,
-        )
-
-    # נביא במקביל BNB + SLH
-    bnb_balance_dec, slh_balance_dec = await asyncio.gather(
-        _fetch_bnb_balance(wallet.bnb_address),
-        _fetch_slh_balance(wallet.bnb_address),
-    )
-
-    return schemas.BalancesOut(
-        telegram_id=wallet.telegram_id,
-        bnb_address=wallet.bnb_address,
-        ton_address=wallet.ton_address,
-        slh_address=wallet.slh_address,
-        bnb_balance=float(bnb_balance_dec),
-        slh_balance=float(slh_balance_dec),
-    )
+    return bnb_balance, slh_balance
 
 
-# --------- ROUTES ---------
+# ===== Routes =====
 
 
 @router.post("/set", response_model=schemas.WalletOut)
-async def set_wallet(
-    payload: schemas.WalletSetIn,
+def set_wallet(
+    wallet_in: schemas.WalletSetIn,
     telegram_id: str = Query(..., description="Telegram user ID"),
     username: Optional[str] = Query(None, description="Telegram username"),
     first_name: Optional[str] = Query(None, description="Telegram first name"),
     db: Session = Depends(get_db),
-):
+) -> schemas.WalletOut:
     """
-    יצירת/עדכון ארנק עבור משתמש טלגרם.
+    יצירה / עדכון ארנק למשתמש טלגרם.
+    - מקבל query params: telegram_id, username, first_name
+    - גוף JSON: bnb_address, ton_address (אופציונלי)
     """
     logger.info(
         "Upserting wallet: telegram_id=%s username=%s first_name=%s bnb=%s ton=%s",
         telegram_id,
         username,
         first_name,
-        payload.bnb_address,
-        payload.ton_address,
+        wallet_in.bnb_address,
+        wallet_in.ton_address,
     )
 
-    wallet = upsert_wallet(
-        db=db,
-        telegram_id=telegram_id,
-        username=username,
-        first_name=first_name,
-        bnb_address=payload.bnb_address,
-        ton_address=payload.ton_address,
-    )
-    return wallet
+    wallet = db.get(models.Wallet, telegram_id)
+
+    if wallet is None:
+        wallet = models.Wallet(
+            telegram_id=telegram_id,
+            username=username or "",
+            first_name=first_name or "",
+            bnb_address=wallet_in.bnb_address,
+            ton_address=wallet_in.ton_address,
+        )
+        db.add(wallet)
+    else:
+        wallet.username = username or wallet.username
+        wallet.first_name = first_name or wallet.first_name
+        wallet.bnb_address = wallet_in.bnb_address
+        wallet.ton_address = wallet_in.ton_address
+
+    db.commit()
+    db.refresh(wallet)
+
+    return schemas.WalletOut.from_orm(wallet)
 
 
 @router.get("/{telegram_id}", response_model=schemas.WalletOut)
-async def get_wallet(
-    telegram_id: str,
-    db: Session = Depends(get_db),
-):
+def get_wallet(
+    telegram_id: str, db: Session = Depends(get_db)
+) -> schemas.WalletOut:
     """
-    החזרת פרטי ארנק לפי telegram_id.
+    החזרת נתוני הארנק השמורים למשתמש (ללא שאלית רשת).
     """
     wallet = db.get(models.Wallet, telegram_id)
-    if not wallet:
+    if wallet is None:
         raise HTTPException(status_code=404, detail="Wallet not found")
-    return wallet
+
+    return schemas.WalletOut.from_orm(wallet)
 
 
 @router.get("/{telegram_id}/balances", response_model=schemas.BalancesOut)
-async def get_balances(
-    telegram_id: str,
-    db: Session = Depends(get_db),
-):
+def get_balances(
+    telegram_id: str, db: Session = Depends(get_db)
+) -> schemas.BalancesOut:
     """
-    החזרת יתרות אמיתיות מ-BSC (BNB + SLH) לפי הארנק השמור.
+    החזרת יתרות אמיתיות (BNB + SLH) מהבלוקצ'יין + הכתובות השמורות.
+
+    - מושך את הארנק מה-DB לפי telegram_id.
+    - אם אין כתובת BNB – מחזיר 0.
+    - אם יש BNB address ויש הגדרות BscScan – מושך יתרות אמיתיות.
     """
     wallet = db.get(models.Wallet, telegram_id)
-    if not wallet:
+    if wallet is None:
         raise HTTPException(status_code=404, detail="Wallet not found")
 
-    balances = await get_balances_live(wallet)
-    logger.info(
-        "Balances for %s – BNB=%s, SLH=%s",
-        telegram_id,
-        balances.bnb_balance,
-        balances.slh_balance,
+    bnb_balance = 0.0
+    slh_balance = 0.0
+
+    if wallet.bnb_address:
+        bnb_balance, slh_balance = _fetch_bnb_and_slh_balances(wallet.bnb_address)
+
+    return schemas.BalancesOut(
+        telegram_id=wallet.telegram_id,
+        bnb_address=wallet.bnb_address,
+        ton_address=wallet.ton_address,
+        slh_address=wallet.slh_address,
+        bnb_balance=bnb_balance,
+        slh_balance=slh_balance,
     )
-    return balances
