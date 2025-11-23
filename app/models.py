@@ -1,31 +1,29 @@
+
 from datetime import datetime
-
 from sqlalchemy import Column, DateTime, String
-from sqlalchemy.orm import declarative_base
-
-Base = declarative_base()
-
+from .db import Base
 
 class Wallet(Base):
     __tablename__ = "wallets"
 
-    # מזהה טלגרם - primary key
-    telegram_id = Column(String(64), primary_key=True, index=True)
+    telegram_id = Column(String, primary_key=True, index=True)
+    username = Column(String, nullable=True)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
 
-    # פרטי משתמש מהבוט
-    username = Column(String(255), nullable=True, index=True)
-    first_name = Column(String(255), nullable=True)
-    last_name = Column(String(255), nullable=True)
+    # One BSC address used for both BNB and SLH
+    bnb_address = Column(String, nullable=False)
 
-    # כתובת BNB / SLH (אותה כתובת משמשת לשני המטבעות)
-    bnb_address = Column(String(255), nullable=True, index=True)
+    # Optional TON address for identity / multi-chain
+    ton_address = Column(String, nullable=True)
 
-    # כתובת TON לאימות זהות
-    ton_address = Column(String(255), nullable=True, index=True)
+    # Optional SLH-specific column – we keep it for compatibility and
+    # always mirror bnb_address into it so the DB schema stays in sync.
+    slh_address = Column(String, nullable=True)
 
-    # כתובת SLH נפרדת (לעתיד, אבל קיימת בעמודות)
-    slh_address = Column(String(255), nullable=True, index=True)
-
-    # חותמות זמן
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
