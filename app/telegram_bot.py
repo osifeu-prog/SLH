@@ -1,12 +1,11 @@
-from __future__ import annotations
-
-import asyncio
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Body, HTTPException
+import httpx
+from fastapi import APIRouter, Request
 from telegram import Update
 from telegram.ext import (
+    AIORateLimiter,
     Application,
     ApplicationBuilder,
     CommandHandler,
@@ -14,100 +13,80 @@ from telegram.ext import (
 )
 
 from .config import settings
-from .db import SessionLocal
-from .models import Wallet
 
 logger = logging.getLogger("slh.bot")
 
-router = APIRouter(
-    prefix="/telegram",
-    tags=["telegram"],
-)
+router = APIRouter(tags=["telegram"])
 
 _application: Optional[Application] = None
-_application_lock = asyncio.Lock()
 
 
-def _normalize_address(addr: Optional[str]) -> Optional[str]:
-    if addr is None:
-        return None
-    addr = addr.strip()
-    return addr or None
+async def _build_application() -> Application:
+    """Build the Telegram Application with all handlers attached."""
+    if not settings.telegram_bot_token:
+        raise RuntimeError("telegram_bot_token not configured")
+
+    application = (
+        ApplicationBuilder()
+        .token(settings.telegram_bot_token)
+        .rate_limiter(AIORateLimiter())
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("wallet", cmd_wallet))
+    application.add_handler(CommandHandler("set_wallet", cmd_set_wallet))
+    application.add_handler(CommandHandler("balances", cmd_balances))
+
+    return application
 
 
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
+async def get_application() -> Application:
+    """Singleton-ish accessor so FastAPI + webhooks share the same Application."""
+    global _application
+    if _application is None:
+        logger.info("Building Telegram Application (webhook mode)...")
+        _application = await _build_application()
+        logger.info("Telegram Application initialized.")
+    return _application
 
 
-def _upsert_wallet_sync(
-    telegram_id: str,
-    username: Optional[str],
-    first_name: Optional[str],
-    bnb_address: str,
-    ton_address: Optional[str],
-) -> Wallet:
+def _api_base_url() -> str:
     """
-    פעולה סינכרונית שרצה בתוך thread לצורך גישה ל-DB.
+    Resolve the base URL for calling our own API.
+
+    In production we expect settings.base_url to be set (e.g. Railway public URL).
+    Fallback is http://localhost:8080 for local/dev usage.
     """
-    session = SessionLocal()
-    try:
-        wallet = session.get(Wallet, telegram_id)
-        if wallet is None:
-            wallet = Wallet(
-                telegram_id=telegram_id,
-                username=username,
-                first_name=first_name,
-                bnb_address=bnb_address,
-                ton_address=ton_address,
-            )
-            session.add(wallet)
-        else:
-            wallet.username = username or wallet.username
-            wallet.first_name = first_name or wallet.first_name
-            wallet.bnb_address = bnb_address
-            wallet.ton_address = ton_address
-
-        session.commit()
-        session.refresh(wallet)
-        return wallet
-    finally:
-        session.close()
-
-
-def _get_wallet_sync(telegram_id: str) -> Optional[Wallet]:
-    session = SessionLocal()
-    try:
-        return session.get(Wallet, telegram_id)
-    finally:
-        session.close()
-
-
-# ---------------------------------------------------------------------------
-# Telegram command handlers
-# ---------------------------------------------------------------------------
+    if settings.base_url:
+        return settings.base_url.rstrip("/")
+    return "http://localhost:8080"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Welcome message + basic help."""
     user = update.effective_user
-    if user is None:
+    if not user or not update.message:
         return
 
+    community_part = ""
+    if settings.community_link:
+        community_part = f"\n\n🔗 קישור לקהילה: {settings.community_link}"
+
     text = (
-        f"שלום @{user.username or user.id}! 🌐\n\n"
+        f"שלום @{user.username or user.first_name or 'חבר'}! 🌐\n\n"
         "ברוך הבא ל-SLH Community Wallet 🚀\n\n"
         "פקודות זמינות:\n"
         "/wallet - רישום/עדכון הארנק שלך\n"
-        "/balances - צפייה ביתרות (כרגע 0, בסיס לממשק עתידי)\n\n"
-        "הרעיון: להזין כתובת BNB (שמשמשת גם ל-SLH באותה כתובת), "
-        "ובעתיד גם כתובת TON לצורך אימות זהות והרשאות קהילתיות."
+        "/balances - צפייה ביתרות (כרגע 0, בסיס לממשק עתידי)"
+        f"{community_part}"
     )
-    await update.effective_chat.send_message(text)
+    await update.message.reply_text(text)
 
 
 async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user is None:
+    """Explain how to register / update a wallet."""
+    if not update.message:
         return
 
     text = (
@@ -120,165 +99,102 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4\n"
         "/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4 UQCXXXXX..."
     )
-    await update.effective_chat.send_message(text)
+    await update.message.reply_text(text)
 
 
 async def cmd_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Parse /set_wallet and call the API to upsert the wallet."""
     user = update.effective_user
-    chat = update.effective_chat
-    if user is None or chat is None:
+    if not user or not update.message:
         return
 
-    args = context.args or []
-    if len(args) == 0:
-        await chat.send_message(
-            "שימוש:\n"
-            "/set_wallet <כתובת_BNB>\n"
-            "או:\n"
-            "/set_wallet <כתובת_BNB> <כתובת_TON>"
+    parts = update.message.text.strip().split()
+    if len(parts) not in (2, 3):
+        await update.message.reply_text(
+            "שימוש: /set_wallet <כתובת_BNB>\n"
+            "או: /set_wallet <כתובת_BNB> <כתובת_TON>"
         )
         return
 
-    bnb_address = _normalize_address(args[0])
-    ton_address = _normalize_address(args[1]) if len(args) > 1 else None
+    if len(parts) == 2:
+        _, bnb_address = parts
+        ton_address = None
+    else:
+        _, bnb_address, ton_address = parts
 
-    if not bnb_address:
-        await chat.send_message("❌ כתובת BNB לא תקינה.")
-        return
+    api_base = _api_base_url()
+    url = f"{api_base}/api/wallet/set"
 
-    telegram_id = str(user.id)
-    username = user.username or None
-    first_name = user.first_name or None
+    payload = {
+        "bnb_address": bnb_address,
+        "ton_address": ton_address,
+    }
+
+    params = {
+        "telegram_id": str(user.id),
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+    }
+
+    logger.info(
+        "Sending wallet update to API: url=%s telegram_id=%s bnb=%s ton=%s",
+        url,
+        params["telegram_id"],
+        bnb_address,
+        ton_address,
+    )
 
     try:
-        wallet = await asyncio.to_thread(
-            _upsert_wallet_sync,
-            telegram_id,
-            username,
-            first_name,
-            bnb_address,
-            ton_address,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to upsert wallet for %s: %s", telegram_id, exc)
-        await chat.send_message("❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר.")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload, params=params)
+        resp.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to update wallet via API: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר.")
         return
 
-    msg = (
-        "✅ הארנק שלך עודכן בהצלחה!\n\n"
-        f"Telegram ID: `{wallet.telegram_id}`\n"
-        f"BNB/SLH: `{wallet.bnb_address}`\n"
-    )
-    if wallet.ton_address:
-        msg += f"TON: `{wallet.ton_address}`\n"
-
-    msg += "\nכעת תוכל להשתמש ב-/balances כדי לראות את היתרות (בשלב זה 0, בסיס למערכת מלאה)."
-
-    await chat.send_message(msg, parse_mode="Markdown")
+    if update.message:
+        await update.message.reply_text("✅ הארנק עודכן בהצלחה!")
 
 
 async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch balances for the current user (placeholder, returns zeros)."""
     user = update.effective_user
-    chat = update.effective_chat
-    if user is None or chat is None:
+    if not user or not update.message:
         return
 
-    telegram_id = str(user.id)
+    api_base = _api_base_url()
+    url = f"{api_base}/api/wallet/{user.id}/balances"
 
     try:
-        wallet = await asyncio.to_thread(_get_wallet_sync, telegram_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to load wallet for %s: %s", telegram_id, exc)
-        await chat.send_message("❌ בעיית תקשורת עם השרת. נסה שוב מאוחר יותר.")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to fetch balances from API: %s", e)
+        await update.message.reply_text("❌ לא הצלחתי למשוך יתרות כרגע. נסה שוב מאוחר יותר.")
         return
 
-    if wallet is None:
-        await chat.send_message(
-            "לא נמצא אצלנו ארנק עבור המשתמש הזה.\n"
-            "השתמש ב-/wallet כדי לרשום את הארנק שלך."
-        )
-        return
-
-    # כרגע – כל היתרות 0, רק מציגים את הכתובות.
     text = (
-        "📊 יתרות דמו (הקוד מוכן לחיבור לרשת אמיתית):\n\n"
-        f"BNB/SLH (BSC): `{wallet.bnb_address}`\n"
+        "📊 יתרות ארנק SLH (דמו):\n\n"
+        f"BNB: {data.get('bnb_balance', 0)} (כתובת: {data.get('bnb_address') or 'N/A'})\n"
+        f"SLH: {data.get('slh_balance', 0)} (כתובת: {data.get('slh_address') or 'N/A'})"
     )
-    if wallet.ton_address:
-        text += f"TON: `{wallet.ton_address}`\n"
-
-    text += "\nBNB: 0.0\nSLH: 0.0\n\nבהמשך נחבר ל-BscScan / RPC + TON כדי לקרוא יתרות אמת."
-
-    await chat.send_message(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 
-# ---------------------------------------------------------------------------
-# Application builder + webhook integration
-# ---------------------------------------------------------------------------
-
-
-async def build_application() -> Application:
+@router.post("/telegram/webhook")
+async def telegram_webhook(request: Request) -> dict:
     """
-    Build and start the Telegram Application for webhook mode.
-    """
-    logger.info("Building Telegram Application (webhook mode)...")
+    Telegram webhook endpoint.
 
-    app = (
-        ApplicationBuilder()
-        .token(settings.telegram_bot_token)
-        .concurrent_updates(True)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("wallet", cmd_wallet))
-    app.add_handler(CommandHandler("set_wallet", cmd_set_wallet))
-    app.add_handler(CommandHandler("balances", cmd_balances))
-
-    await app.initialize()
-    await app.start()
-
-    # קביעת webhook לכתובת /telegram/webhook
-    if settings.base_url:
-        webhook_url = settings.base_url.rstrip("/") + "/telegram/webhook"
-        logger.info("Setting Telegram webhook to %s", webhook_url)
-        await app.bot.set_webhook(webhook_url)
-    else:
-        logger.warning("BASE_URL not set – Telegram webhook not configured.")
-
-    logger.info("Telegram Application initialized.")
-    return app
-
-
-async def get_application() -> Application:
-    """
-    מוחזר ה-Application הגלובלי. אם לא קיים – נבנה אותו.
-    """
-    global _application
-
-    async with _application_lock:
-        if _application is None:
-            _application = await build_application()
-        return _application
-
-
-@router.post("/webhook")
-async def telegram_webhook(
-    update_dict: dict = Body(...),
-) -> dict:
-    """
-    נקודת כניסה לעדכוני טלגרם (Webhook).
-
-    Railway מכוון את טלגרם לכתובת:
-    {BASE_URL}/telegram/webhook
+    Telegram will POST updates here; we deserialize them and pass to the shared
+    Application instance.
     """
     app = await get_application()
-
-    try:
-        update = Update.de_json(update_dict, app.bot)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Invalid update payload: %s", exc)
-        raise HTTPException(status_code=400, detail="Invalid update payload")
-
+    data = await request.json()
+    update = Update.de_json(data, app.bot)
     await app.process_update(update)
     return {"ok": True}
