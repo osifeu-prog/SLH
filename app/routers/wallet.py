@@ -12,28 +12,20 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.db import get_db
-from app.config import settings as app_settings
 
 logger = logging.getLogger("slh.wallet")
 
 router = APIRouter(prefix="/api/wallet", tags=["wallet"])
-
 
 # --------- CONFIG ---------
 
 
 def get_config() -> SimpleNamespace:
     """
-    קורא את הגדרות האפליקציה + משתני סביבה רלוונטיים ל-BSC/SLH.
+    קורא משתני סביבה רלוונטיים ל-BSC/SLH.
+    כל מה שהגדרת ב-Railway תחת web -> Variables.
     """
     return SimpleNamespace(
-        ENV=app_settings.env,
-        DATABASE_URL=app_settings.database_url,
-        TELEGRAM_BOT_TOKEN=app_settings.telegram_bot_token,
-        BASE_URL=app_settings.base_url,
-        LOG_LEVEL=app_settings.log_level,
-        ADMIN_LOG_CHAT_ID=app_settings.admin_log_chat_id,
-        # BSC / SLH
         BSC_RPC_URL=os.getenv(
             "BSC_RPC_URL", "https://bsc-dataseed.binance.org/"
         ),
@@ -46,7 +38,6 @@ def get_config() -> SimpleNamespace:
 config = get_config()
 
 BSCSCAN_API_URL = "https://api.bscscan.com/api"
-
 
 # --------- HELPERS: DB ---------
 
@@ -134,7 +125,6 @@ async def _fetch_bnb_balance(address: str) -> Decimal:
         logger.warning("BscScan BNB balance error: %s", data)
         return Decimal(0)
 
-    # result is in wei
     wei_str = data.get("result", "0")
     try:
         wei = Decimal(wei_str)
@@ -148,7 +138,8 @@ async def _fetch_bnb_balance(address: str) -> Decimal:
 
 async def _fetch_slh_balance(address: str) -> Decimal:
     """
-    מחזיר יתרת טוקן SLH (BEP-20) לפי החוזה, דרך BscScan.
+    מחזיר יתרת טוקן SLH (BEP-20) לפי החוזה שסיפקת, דרך BscScan.
+    משתמש ב-SLH_TOKEN_ADDRESS + SLH_TOKEN_DECIMALS מה-ENV.
     """
     if not config.BSCSCAN_API_KEY or not config.SLH_TOKEN_ADDRESS:
         logger.warning(
@@ -174,10 +165,7 @@ async def _fetch_slh_balance(address: str) -> Decimal:
         logger.exception("Failed to fetch SLH balance from BscScan: %s", exc)
         return Decimal(0)
 
-    if data.get("status") not in ("1", 1, None):
-        # לעתים BscScan מחזיר status="0" עם result תקין – לא נעצור את זה
-        logger.warning("BscScan SLH balance warning: %s", data)
-
+    # יש מצבים ש-BscScan מחזיר status="0" אבל עדיין נותן result; לא נכשיל את זה
     raw_str = data.get("result", "0")
     try:
         raw = Decimal(raw_str)
@@ -185,7 +173,7 @@ async def _fetch_slh_balance(address: str) -> Decimal:
         logger.warning("Invalid SLH raw balance value: %s", raw_str)
         return Decimal(0)
 
-    decimals = int(config.SLH_TOKEN_DECIMALS or 18)
+    decimals = int(os.getenv("SLH_TOKEN_DECIMALS") or config.SLH_TOKEN_DECIMALS or 18)
     factor = Decimal(10) ** Decimal(decimals)
     if factor == 0:
         return Decimal(0)
@@ -208,7 +196,7 @@ async def get_balances_live(wallet: models.Wallet) -> schemas.BalancesOut:
             slh_balance=0.0,
         )
 
-    # נביא במקביל BNB + SLH
+    # BNB + SLH במקביל
     bnb_balance_dec, slh_balance_dec = await asyncio.gather(
         _fetch_bnb_balance(wallet.bnb_address),
         _fetch_slh_balance(wallet.bnb_address),
@@ -237,6 +225,15 @@ async def set_wallet(
 ):
     """
     יצירת/עדכון ארנק עבור משתמש טלגרם.
+
+    query params:
+      - telegram_id
+      - username (optional)
+      - first_name (optional)
+
+    body (JSON):
+      - bnb_address (חובה)
+      - ton_address (אופציונלי)
     """
     logger.info(
         "Upserting wallet: telegram_id=%s username=%s first_name=%s bnb=%s ton=%s",
