@@ -1,10 +1,21 @@
 import os
 
+# 🔐 טוקן הבוט של טלגרם (SLH Community Wallet Bot)
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")  # e.g. https://web-production-XXXX.up.railway.app
+# 🌐 בסיס ה-API של שרת הארנק (SLH Wallet API)
+# דוגמה: https://slh-wallet-production.up.railway.app
+API_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:8000")
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is required for bot-service")
-if not API_BASE_URL:
-    raise RuntimeError("API_BASE_URL is required for bot-service")
+# 🌐 בסיס ה-API של מנוע TON Trading Bot Pro
+# ברירת מחדל: השירות שרץ אצלך בריילווי
+TON_API_BASE_URL: str = os.getenv(
+    "TON_API_BASE_URL",
+    "https://ton-production.up.railway.app",
+)
+
+# 🌍 כתובת אתר הפרויקט (GitHub Pages / Landing Page)
+PROJECT_SITE_URL: str = os.getenv(
+    "PROJECT_SITE_URL",
+    "https://osifeu-prog.github.io/TON/",
+)
