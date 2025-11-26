@@ -22,6 +22,10 @@ BNB_PRICE_API = (
     "?ids=binancecoin&vs_currencies=usd"
 )
 
+# קאש למחיר BNB כדי להימנע מיותר מדי קריאות ל-Coingecko
+_BNB_PRICE_CACHE = None
+_BNB_PRICE_CACHE_TS = None
+
 # מחיר SLH בדולרים – ניתן להגדיר ב-Railway:
 # SLH_USD_PRICE="0.05"  (לדוגמה)
 SLH_USD_FALLBACK = float(os.getenv("SLH_USD_PRICE") or "0")
@@ -90,24 +94,53 @@ def _extract_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # ---- Price helpers ----
 
 
+
 async def _fetch_bnb_price_usd() -> float:
     """
-    משיכת מחיר BNB/USD מ-Coingecko.
-    במקרה של תקלה – מחזיר 0.
+    משיכת מחיר BNB/USD מ-Coingecko עם קאשינג בסיסי כדי למנוע 429.
+    במידה והקריאה נכשלת – נשתמש בערך הקודם אם קיים, אחרת נחזיר 0.
     """
+    global _BNB_PRICE_CACHE, _BNB_PRICE_CACHE_TS
+
+    # אם יש לנו מחיר בקאש מה-5 דקות האחרונות – נחזיר אותו
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        from datetime import datetime, timedelta  # import פנימי כדי לא לשבור קוד קיים
+    except Exception:
+        datetime = None  # fallback תאורטי
+
+    try:
+        if datetime is not None and _BNB_PRICE_CACHE is not None and _BNB_PRICE_CACHE_TS is not None:
+            if datetime.utcnow() - _BNB_PRICE_CACHE_TS < timedelta(minutes=5):
+                return _BNB_PRICE_CACHE
+    except NameError:
+        # אם המשתנים עדיין לא הוגדרו
+        _BNB_PRICE_CACHE = None
+        _BNB_PRICE_CACHE_TS = None
+
+    # אין קאש או שהוא ישן – ננסה למשוך מחדש
+    try:
+        import httpx as _httpx  # שימוש ב-httpx הקיים
+        async with _httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(BNB_PRICE_API)
         resp.raise_for_status()
         data = resp.json()
         price = float(data.get("binancecoin", {}).get("usd", 0.0) or 0.0)
+        if price > 0:
+            _BNB_PRICE_CACHE = price
+            if datetime is not None:
+                _BNB_PRICE_CACHE_TS = datetime.utcnow()
         return price
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to fetch BNB price from CoinGecko: %s", exc)
-        return 0.0
+        logger.warning("Failed to fetch BNB price from CoinGecko (using cache/fallback): %s", exc)
+        try:
+            # אם יש לנו ערך בקאש – נחזיר אותו
+            return _BNB_PRICE_CACHE or 0.0
+        except Exception:
+            return 0.0
 
 
 def _get_slh_price_usd() -> float:
+() -> float:
     """
     מחזיר מחיר SLH בדולרים.
     כרגע מתוך ENV: SLH_USD_PRICE.
