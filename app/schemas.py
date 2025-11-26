@@ -1,32 +1,35 @@
 
-from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel
+
 
 class WalletSetIn(BaseModel):
-    bnb_address: str = Field(..., description="BSC address (used for both BNB and SLH)")
-    ton_address: Optional[str] = Field(
-        None,
-        description="Optional TON address for identity verification",
-    )
-
-class WalletOut(BaseModel):
-    telegram_id: str
-    username: Optional[str] = None
-    first_name: Optional[str] = None
     bnb_address: str
     ton_address: Optional[str] = None
     slh_address: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+
+
+class WalletOut(BaseModel):
+    telegram_id: str
+    bnb_address: Optional[str]
+    ton_address: Optional[str]
+    slh_address: Optional[str]
+    username: Optional[str]
+    first_name: Optional[str]
 
     class Config:
-        from_attributes = True
+        orm_mode = True
+
 
 class BalancesOut(BaseModel):
     telegram_id: str
-    bnb_address: str
-    slh_address: str
-    ton_address: Optional[str] = None
+    bnb_address: Optional[str]
+    ton_address: Optional[str]
+    slh_address: Optional[str]
     bnb_balance: float = 0.0
-    slh_balance: float = 0.0
+    slh_balance: float = 0.0            # total (on-chain + internal)
+    slh_balance_onchain: float = 0.0
+    slh_balance_internal: float = 0.0
