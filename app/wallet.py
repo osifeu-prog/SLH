@@ -11,10 +11,27 @@ from app import models, schemas
 from app.config import settings
 from app.db import get_db
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/wallet", tags=["wallet"])
 
 
+# =========================
+#  Helper functions – RPC
+# =========================
+
 async def _rpc_call(method: str, params: list) -> Optional[str]:
+    """
+    Low-level JSON-RPC call to BSC node.
+    Returns the `result` field as hex string or None on failure.
+    """
+    rpc_url = settings.BSC_RPC_URL
+    if not rpc_url:
+        logger.warning("BSC_RPC_URL not configured, skipping RPC call.")
+        return None
+
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -22,7 +39,6 @@ async def _rpc_call(method: str, params: list) -> Optional[str]:
         "params": params,
     }
 
-    rpc_url = settings.BSC_RPC_URL
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -30,33 +46,66 @@ async def _rpc_call(method: str, params: list) -> Optional[str]:
             resp.raise_for_status()
             data = resp.json()
             return data.get("result")
-        except Exception:
+        except Exception as e:
+            logger.error(f"RPC call failed [{method}]: {e}")
             return None
 
 
 def _decode_hex_to_decimal(value_hex: Optional[str], decimals: int) -> Decimal:
+    """
+    Convert hex string (wei-like) to Decimal with given decimals.
+    Safe against None/invalid values.
+    """
     if not value_hex:
         return Decimal("0")
+
     if value_hex.startswith("0x"):
         value_hex = value_hex[2:]
+
     try:
         wei_int = int(value_hex or "0", 16)
     except ValueError:
         return Decimal("0")
+
     factor = Decimal(10) ** decimals
     return (Decimal(wei_int) / factor).quantize(Decimal("0.000000000000000001"))
 
 
 async def _fetch_bnb_balance(address: str) -> Decimal:
+    """
+    Get native BNB balance (18 decimals) for given address.
+    """
+    if not address:
+        return Decimal("0")
+
     result = await _rpc_call("eth_getBalance", [address, "latest"])
     return _decode_hex_to_decimal(result, 18)
 
 
 async def _fetch_slh_balance(address: str) -> Decimal:
-    token = settings.SLH_TOKEN_ADDRESS
-    if not token:
+    """
+    Get SLH token balance for given address (using SLH_TOKEN_ADDRESS).
+
+    Uses:
+    - settings.SLH_TOKEN_ADDRESS
+    - settings.SLH_TOKEN_DECIMALS
+    - settings.SLH_ONCHAIN_ENABLED
+
+    If on-chain disabled or token not set → returns 0.
+    """
+    if not getattr(settings, "SLH_ONCHAIN_ENABLED", False):
+        # On-chain tracking disabled – internal ledger only
         return Decimal("0")
 
+    token = settings.SLH_TOKEN_ADDRESS
+    if not token:
+        logger.warning("SLH_TOKEN_ADDRESS not configured, returning 0.")
+        return Decimal("0")
+
+    if not address:
+        return Decimal("0")
+
+    # ERC20 balanceOf(address) signature
     data = (
         "0x70a08231"
         + "0" * 24
@@ -73,10 +122,21 @@ async def _fetch_slh_balance(address: str) -> Decimal:
             "latest",
         ],
     )
-    return _decode_hex_to_decimal(result, settings.SLH_TOKEN_DECIMALS)
 
+    decimals = getattr(settings, "SLH_TOKEN_DECIMALS", 18)
+    return _decode_hex_to_decimal(result, decimals)
+
+
+# =========================
+#  Internal ledger helpers
+# =========================
 
 async def _get_internal_slh_balance(db: Session, telegram_id: str) -> Decimal:
+    """
+    Calculate internal SLH balance from the transactions ledger.
+
+    incoming - outgoing for currency='SLH' and chain='INTERNAL'
+    """
     incoming = (
         db.query(func.coalesce(func.sum(models.Transaction.amount), 0))
         .filter(
@@ -86,6 +146,7 @@ async def _get_internal_slh_balance(db: Session, telegram_id: str) -> Decimal:
         )
         .scalar()
     )
+
     outgoing = (
         db.query(func.coalesce(func.sum(models.Transaction.amount), 0))
         .filter(
@@ -102,8 +163,16 @@ async def _get_internal_slh_balance(db: Session, telegram_id: str) -> Decimal:
 
 
 async def get_balances_live(wallet: models.Wallet, db: Session) -> schemas.BalancesOut:
+    """
+    Combined view:
+    - bnb_balance      – from BSC RPC
+    - slh_balance      – onchain + internal
+    - slh_balance_onchain
+    - slh_balance_internal
+    """
     internal_slh = await _get_internal_slh_balance(db, wallet.telegram_id)
 
+    # No BNB address – internal-only wallet
     if not wallet.bnb_address:
         total_slh = internal_slh
         return schemas.BalancesOut(
@@ -117,6 +186,7 @@ async def get_balances_live(wallet: models.Wallet, db: Session) -> schemas.Balan
             slh_balance_internal=float(internal_slh),
         )
 
+    # On-chain BNB + SLH
     bnb_balance_dec, slh_balance_dec = await asyncio.gather(
         _fetch_bnb_balance(wallet.bnb_address),
         _fetch_slh_balance(wallet.slh_address or wallet.bnb_address),
@@ -136,6 +206,10 @@ async def get_balances_live(wallet: models.Wallet, db: Session) -> schemas.Balan
     )
 
 
+# =========================
+#  API routes
+# =========================
+
 @router.post("/set", response_model=schemas.WalletOut)
 async def set_wallet(
     payload: schemas.WalletSetIn,
@@ -144,6 +218,13 @@ async def set_wallet(
     first_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
+    """
+    Create or update a wallet record for a Telegram user.
+
+    Called by the Telegram bot when user sends /set_wallet.
+    - Ensures SLH address defaults to BNB address if not specified.
+    - Updates username / first_name from Telegram if sent.
+    """
     wallet = (
         db.query(models.Wallet)
         .filter(models.Wallet.telegram_id == telegram_id)
@@ -151,6 +232,7 @@ async def set_wallet(
     )
 
     if wallet is None:
+        # New wallet
         wallet = models.Wallet(
             telegram_id=str(telegram_id),
             bnb_address=payload.bnb_address,
@@ -161,14 +243,20 @@ async def set_wallet(
             is_active=True,
         )
         db.add(wallet)
+        logger.info(f"Created new wallet for Telegram ID {telegram_id}")
     else:
-        wallet.bnb_address = payload.bnb_address or wallet.bnb_address
+        # Update existing wallet
+        if payload.bnb_address:
+            wallet.bnb_address = payload.bnb_address
+
         wallet.slh_address = (
             payload.slh_address or wallet.slh_address or wallet.bnb_address
         )
         wallet.ton_address = payload.ton_address or wallet.ton_address
         wallet.username = username or payload.username or wallet.username
         wallet.first_name = first_name or payload.first_name or wallet.first_name
+
+        logger.info(f"Updated wallet for Telegram ID {telegram_id}")
 
     db.commit()
     db.refresh(wallet)
@@ -177,6 +265,9 @@ async def set_wallet(
 
 @router.get("/{telegram_id}", response_model=schemas.WalletOut)
 async def get_wallet(telegram_id: str, db: Session = Depends(get_db)):
+    """
+    Get raw wallet record (addresses/profile) by Telegram ID.
+    """
     wallet = (
         db.query(models.Wallet)
         .filter(models.Wallet.telegram_id == telegram_id)
@@ -189,6 +280,13 @@ async def get_wallet(telegram_id: str, db: Session = Depends(get_db)):
 
 @router.get("/{telegram_id}/balances", response_model=schemas.BalancesOut)
 async def get_balances(telegram_id: str, db: Session = Depends(get_db)):
+    """
+    Get live balances for the wallet:
+    - BNB from chain
+    - SLH from chain
+    - Internal SLH from ledger
+    - Combined total
+    """
     wallet = (
         db.query(models.Wallet)
         .filter(models.Wallet.telegram_id == telegram_id)
@@ -198,3 +296,25 @@ async def get_balances(telegram_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Wallet not found")
 
     return await get_balances_live(wallet, db)
+
+
+@router.get("/{telegram_id}/internal_balance")
+async def get_internal_balance(telegram_id: str, db: Session = Depends(get_db)):
+    """
+    Debug/helper endpoint:
+    Returns only the INTERNAL SLH balance (from transactions table).
+    Useful for verifying /send_slh /claim logic.
+    """
+    wallet = (
+        db.query(models.Wallet)
+        .filter(models.Wallet.telegram_id == telegram_id)
+        .first()
+    )
+    if wallet is None:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    internal_slh = await _get_internal_slh_balance(db, telegram_id)
+    return {
+        "telegram_id": telegram_id,
+        "slh_balance_internal": float(internal_slh),
+    }
