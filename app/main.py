@@ -3,22 +3,28 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import settings
-from .db import Base, engine
-from .routers import wallet as wallet_router
-from . import telegram  # זה הקובץ app/telegram.py החדש
+from app.config import settings
+from app.routers import wallet as wallet_router
+from app import telegram  # מכאן מגיע ה-webhook של הטלגרם
 
-logger = logging.getLogger("slh")
+# =========================
+#  Logging בסיסי
+# =========================
+
+log_level = getattr(settings, "LOG_LEVEL", "info").upper()
+logging.basicConfig(level=log_level)
+logger = logging.getLogger(__name__)
+
+# =========================
+#  FastAPI app
+# =========================
 
 app = FastAPI(
-    title="SLH Community Wallet",
+    title="SLH Community Wallet API",
     version="0.1.0",
 )
 
-# יצירת טבלאות DB (אם צריך)
-Base.metadata.create_all(bind=engine)
-
-# CORS בסיסי (שיהיה נחמד ל-frontend)
+# CORS פתוח – אפשר להקשיח בהמשך
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,15 +33,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
-app.include_router(wallet_router.router)
-app.include_router(telegram.router)
+
+# =========================
+#  Health & Root
+# =========================
+
+@app.get("/health")
+async def health():
+    """
+    Endpoint לריילווי – אם זה מחזיר 200 OK, ה-service נחשב 'חי'.
+    """
+    return {"status": "ok"}
 
 
 @app.get("/")
-async def index():
+async def root():
+    """
+    Root פשוט – נוח לבדיקה מהדפדפן.
+    """
     return {
-        "ok": True,
-        "service": "SLH Community Wallet",
-        "env": settings.env,
+        "service": "slh_community_wallet",
+        "status": "ok",
+        "env": getattr(settings, "ENV", "unknown"),
     }
+
+
+# =========================
+#  Routers
+# =========================
+
+# API של הארנק (BSC + פנימי)
+app.include_router(wallet_router.router)
+
+# API של הבוט (webhook /telegram/webhook וכו')
+app.include_router(telegram.router)
+
+
+# =========================
+#  Events
+# =========================
+
+@app.on_event("startup")
+async def on_startup():
+    logger.info("🚀 SLH Community Wallet API started")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logger.info("👋 SLH Community Wallet API shutdown")
