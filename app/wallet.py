@@ -15,7 +15,6 @@ router = APIRouter(prefix="/api/wallet", tags=["wallet"])
 
 
 async def _rpc_call(method: str, params: list) -> Optional[str]:
-    # Low-level JSON-RPC call to BSC. Returns result field as hex string, or None on error.
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -54,12 +53,10 @@ async def _fetch_bnb_balance(address: str) -> Decimal:
 
 
 async def _fetch_slh_balance(address: str) -> Decimal:
-    # Uses eth_call on the SLH BEP-20 contract balanceOf(address).
     token = settings.SLH_TOKEN_ADDRESS
     if not token:
         return Decimal("0")
 
-    # balanceOf(address) signature: 70a08231
     data = (
         "0x70a08231"
         + "0" * 24
@@ -80,7 +77,6 @@ async def _fetch_slh_balance(address: str) -> Decimal:
 
 
 async def _get_internal_slh_balance(db: Session, telegram_id: str) -> Decimal:
-    # Aggregate all INTERNAL SLH transactions for this user.
     incoming = (
         db.query(func.coalesce(func.sum(models.Transaction.amount), 0))
         .filter(
@@ -106,7 +102,6 @@ async def _get_internal_slh_balance(db: Session, telegram_id: str) -> Decimal:
 
 
 async def get_balances_live(wallet: models.Wallet, db: Session) -> schemas.BalancesOut:
-    # Combines on-chain BNB + SLH balances with internal SLH ledger.
     internal_slh = await _get_internal_slh_balance(db, wallet.telegram_id)
 
     if not wallet.bnb_address:
@@ -149,7 +144,6 @@ async def set_wallet(
     first_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    # Create / update a wallet record for this Telegram user.
     wallet = (
         db.query(models.Wallet)
         .filter(models.Wallet.telegram_id == telegram_id)
