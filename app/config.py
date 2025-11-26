@@ -43,6 +43,16 @@ class Settings:
     SLH_TOKEN_DECIMALS: int = int(os.getenv("SLH_TOKEN_DECIMALS", "18"))
     SLH_TON_FACTOR: int = int(os.getenv("SLH_TON_FACTOR", "1000"))
 
+    # ============================
+    #   COMMUNITY HOT WALLET (BSC / ADMIN)
+    # ============================
+    COMMUNITY_HOT_WALLET_ADDRESS: str = os.getenv("COMMUNITY_HOT_WALLET_ADDRESS", "")
+    COMMUNITY_HOT_WALLET_PRIVATE_KEY: str = os.getenv("COMMUNITY_HOT_WALLET_PRIVATE_KEY", "")
+    SLH_ONCHAIN_ENABLED: str = os.getenv("SLH_ONCHAIN_ENABLED", "false")
+
+    # רשימת אדמינים (טלגרם ID) בפורמט JSON, לדוגמה: ["224223270"]
+    ADMIN_OWNER_IDS_JSON: str = os.getenv("ADMIN_OWNER_IDS", "[]")
+
     # מחיר SLH קבוע בשקלים – "מספר ההצלחה"
     SLH_ILS_PRICE: float = float(os.getenv("SLH_ILS_PRICE", "444.44"))
 
@@ -89,6 +99,16 @@ class Settings:
     @property
     def base_url(self) -> str:
         return self.BASE_URL
+
+    @property
+    def admin_owner_ids(self) -> List[str]:
+        try:
+            data = json.loads(self.ADMIN_OWNER_IDS_JSON or "[]")
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except Exception:
+            pass
+        return []
 
     @property
     def slh_ils_price(self) -> float:

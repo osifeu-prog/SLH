@@ -3,16 +3,19 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from decimal import Decimal
+from typing import Any, Dict, Optional, List
 
 import httpx
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from .config import settings
 from .db import get_db
-from .models import Wallet
+from .models import Wallet, Transaction
 from .wallet import upsert_wallet
+from .blockchain import send_slh_bsc_onchain, OnchainConfigError
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
@@ -176,16 +179,26 @@ async def telegram_webhook(
     # מקלדת ברירת מחדל
     default_keyboard: Dict[str, Any] = {
         "keyboard": [
+            [{"text": "/wallet"}, {"text": "/balances    # מקלדת ברירת מחדל
+    default_keyboard: Dict[str, Any] = {
+        "keyboard": [
             [{"text": "/wallet"}, {"text": "/balances"}],
-            [{"text": "/send_slh 10 @username"}],
+            [{"text": "/send_slh 10 @username"}, {"text": "/history"}],
+            [{"text": "/claim"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
 
-    # ----- /start -----
-    if text.startswith("/start"):
-        community_link = getattr(settings, "community_link", None) or os.getenv(
+    def _is_admin(telegram_id: str) -> bool:
+        """בודק אם המשתמש הוא אדמין ראשי לפי ENV (ADMIN_OWNER_IDS)."""
+        owners = getattr(settings, "admin_owner_ids", []) or []
+        return str(telegram_id) in [str(x) for x in owners]
+
+    def _onchain_enabled() -> bool:
+        flag = (os.getenv("SLH_ONCHAIN_ENABLED", "false") or "false").lower()
+        return flag in ("1", "true", "yes")
+nv(
             "COMMUNITY_LINK"
         )
 
@@ -328,7 +341,7 @@ async def telegram_webhook(
         note = " ".join(args[2:]) if len(args) > 2 else None
 
         try:
-            amount = float(amount_raw)
+            amount = Decimal(amount_raw)
             if amount <= 0:
                 raise ValueError("amount must be positive")
         except Exception:
@@ -370,19 +383,43 @@ async def telegram_webhook(
             )
             return {"ok": True}
 
-        # בשלב זה ההעברה היא וירטואלית בלבד – רישום לוג בלבד ללא שינוי on-chain
-        logger.info(
-            "Simulated internal transfer: from=%s to=%s amount=%s note=%s",
-            telegram_id,
-            to_wallet.telegram_id,
-            amount,
-            note,
+        # רישום טרנזקציה פנימית
+        tx = Transaction(
+            from_telegram_id=telegram_id,
+            to_telegram_id=to_wallet.telegram_id,
+            amount=amount,
+            currency="SLH",
+            chain="INTERNAL",
+            onchain=False,
+            note=note,
         )
+        db.add(tx)
+        db.commit()
+        db.refresh(tx)
+
+        tx_hash_onchain: Optional[str] = None
+        if _onchain_enabled() and to_wallet.bnb_address:
+            try:
+                tx_hash_onchain = send_slh_bsc_onchain(
+                    to_address=to_wallet.bnb_address,
+                    amount_slh=float(amount),
+                )
+                tx.onchain = True
+                tx.chain = "BSC"
+                tx.tx_hash = tx_hash_onchain
+                db.add(tx)
+                db.commit()
+            except OnchainConfigError as ocfg:
+                logger.warning("On-chain disabled/misconfigured, using internal only: %s", ocfg)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to send on-chain transfer, keeping internal record only: %s", exc)
 
         confirm_text_sender = (
             "✅ בקשת העברה התקבלה!\n\n"
-            f"שלחת (וירטואלי בשלב זה) {amount} SLH אל {to_label}.\n"
+            f"שלחת {amount} SLH אל {to_label}.\n"
         )
+        if tx_hash_onchain:
+            confirm_text_sender += f"\n🔗 on-chain tx: `{tx_hash_onchain}`"
         if note:
             confirm_text_sender += f"\nהערה: {note}"
 
@@ -390,25 +427,215 @@ async def telegram_webhook(
             chat_id,
             confirm_text_sender,
             reply_markup=default_keyboard,
+            parse_mode="Markdown",
         )
 
-        # הודעה לנמען (אם מדובר בצ'אט פרטי רגיל)
+        # הודעה לנמען
         try:
+            notif_text = (
+                "📥 קיבלת העברת SLH מהקהילה!\n\n"
+                f"שולח: @{username or telegram_id}\n"
+                f"סכום: {amount} SLH\n"
+            )
+            if note:
+                notif_text += f"\nהערה: {note}"
+            if tx_hash_onchain:
+                notif_text += f"\n🔗 on-chain tx: `{tx_hash_onchain}`"
+
             await send_message(
                 to_wallet.telegram_id,
-                (
-                    "📥 קיבלת העברת SLH וירטואלית מהקהילה!\n\n"
-                    f"שולח: @{username or telegram_id}\n"
-                    f"סכום: {amount} SLH\n"
-                    + (f"\nהערה: {note}" if note else "")
-                ),
+                notif_text,
                 reply_markup=default_keyboard,
+                parse_mode="Markdown",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to notify recipient about transfer: %s", exc)
 
         return {"ok": True}
 
+
+    # ----- /history -----
+    if text.startswith("/history"):
+        # 10 העברות אחרונות שקשורות למשתמש
+        txs: List[Transaction] = (
+            db.query(Transaction)
+            .filter(
+                or_(
+                    Transaction.from_telegram_id == telegram_id,
+                    Transaction.to_telegram_id == telegram_id,
+                )
+            )
+            .order_by(Transaction.created_at.desc())
+            .limit(10)
+            .all()
+        )
+        if not txs:
+            await send_message(
+                chat_id,
+                "🔍 אין עדיין העברות רשומות עבור משתמש זה.",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        lines = ["📜 היסטוריית העברות (10 אחרונות):", ""]
+        for tx in txs:
+            direction = "➡️" if tx.from_telegram_id == telegram_id else "⬅️"
+            other = tx.to_telegram_id if direction == "➡️" else tx.from_telegram_id
+            onchain_flag = "🟢 on-chain" if tx.onchain else "⚪ internal"
+            ts = tx.created_at.strftime("%Y-%m-%d %H:%M")
+            short_hash = (tx.tx_hash[:10] + "…") if tx.tx_hash else ""
+            line = f"{ts} {direction} {tx.amount} {tx.currency} אל/מ {other} ({onchain_flag})"
+            if short_hash:
+                line += f" [{short_hash}]"
+            lines.append(line)
+
+        await send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=default_keyboard,
+        )
+        return {"ok": True}
+
+    # ----- /claim -----
+    if text.startswith("/claim"):
+        reward_str = os.getenv("CLAIM_REWARD_SLH", "10")
+        try:
+            reward = Decimal(reward_str)
+        except Exception:
+            reward = Decimal("10")
+
+        # רישום כטרנזקציה פנימית מהמערכת למשתמש
+        tx = Transaction(
+            from_telegram_id=None,
+            to_telegram_id=telegram_id,
+            amount=reward,
+            currency="SLH",
+            chain="INTERNAL",
+            onchain=False,
+            note="claim",
+        )
+        db.add(tx)
+        db.commit()
+
+        await send_message(
+            chat_id,
+            f"🎁 קיבלת קליים של {reward} SLH (פנימי).\nניתן לראות זאת ב-/history.",
+            reply_markup=default_keyboard,
+        )
+        return {"ok": True}
+
+    # ----- /airdrop (admin only) -----
+    if text.startswith("/airdrop"):
+        if not _is_admin(telegram_id):
+            await send_message(
+                chat_id,
+                "⛔ אין לך הרשאה לפקודה זו.",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        parts = text.split()
+        args = parts[1:]
+        if len(args) < 2:
+            await send_message(
+                chat_id,
+                "שימוש: /airdrop <amount> <@user1|id1> [@user2|id2 …]",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        amount_raw = args[0]
+        targets_raw = args[1:]
+
+        try:
+            amount = Decimal(amount_raw)
+            if amount <= 0:
+                raise ValueError()
+        except Exception:
+            await send_message(
+                chat_id,
+                "❌ סכום לא חוקי ל-airdrop.",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        success = 0
+        failed = 0
+        for target in targets_raw:
+            # חיפוש נמען
+            if target.startswith("@"):
+                username_target = target[1:]
+                to_wallet = (
+                    db.query(Wallet)
+                    .filter(Wallet.username == username_target)
+                    .first()
+                )
+            else:
+                to_wallet = db.get(Wallet, target)
+
+            if not to_wallet:
+                failed += 1
+                continue
+
+            tx = Transaction(
+                from_telegram_id=telegram_id,
+                to_telegram_id=to_wallet.telegram_id,
+                amount=amount,
+                currency="SLH",
+                chain="INTERNAL",
+                onchain=False,
+                note="airdrop",
+            )
+            db.add(tx)
+            success += 1
+
+            try:
+                await send_message(
+                    to_wallet.telegram_id,
+                    f"🎁 קיבלת airdrop של {amount} SLH מהאדמין!",
+                    reply_markup=default_keyboard,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to notify airdrop recipient: %s", exc)
+
+        db.commit()
+
+        await send_message(
+            chat_id,
+            f"✅ airdrop הסתיים. הצליחו {success}, נכשלו {failed}.",
+            reply_markup=default_keyboard,
+        )
+        return {"ok": True}
+
+    # ----- /admin -----
+    if text.startswith("/admin"):
+        if not _is_admin(telegram_id):
+            await send_message(
+                chat_id,
+                "⛔ אין לך הרשאה לפאנל אדמין.",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        panel_lines = [
+            "🛠 פאנל אדמין SLH:",
+            "",
+            "/airdrop <amount> <@user1|id1> [@user2|id2 …] – חלוקת SLH למשתמשים",
+            "/history – צפייה בהיסטוריית העברות (גם לך וגם להם)",
+            "/claim – בדיקת מנגנון קליימים (לבדיקות / משחקים)",
+            "",
+            "✨ בעתיד נוסיף כאן גם:",
+            "- דוחות רבעוניים למשקיעים",
+            "- שליטה ב-staking / ריביות",
+            "- הגדרות עומק של קהילה ורפררלים",
+        ]
+
+        await send_message(
+            chat_id,
+            "\n".join(panel_lines),
+            reply_markup=default_keyboard,
+        )
+        return {"ok": True}
     # ----- פקודה לא מוכרת -----
     await send_message(
         chat_id,
