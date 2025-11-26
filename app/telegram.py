@@ -1,201 +1,192 @@
+from __future__ import annotations
+
 import logging
 import os
-from typing import Optional, Any, Dict
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
 
 from .config import settings
-
-logger = logging.getLogger(__name__)
+from .db import get_db
+from .models import Wallet
+from .wallet import upsert_wallet
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+logger = logging.getLogger("slh.telegram")
 
-SLH_USD_FALLBACK = float(os.getenv("SLH_USD_PRICE") or "0")
-SLH_ILS_FALLBACK = float(os.getenv("SLH_ILS_PRICE") or "444.44")
+BNB_PRICE_API = (
+    "https://api.coingecko.com/api/v3/simple/price"
+    "?ids=binancecoin&vs_currencies=usd"
+)
 
-
-# ============================
-#   Helpers
-# ============================
+# קאש למחיר BNB כדי למנוע יותר מדי קריאות ל-Coingecko
+_BNB_PRICE_CACHE: Optional[float] = None
+_BNB_PRICE_CACHE_TS: Optional[datetime] = None
 
 
 def _api_base_url() -> str:
     """
-    בסיס ה-API הפנימי שלנו – משמש לקריאות:
-    /api/wallet/set
-    /api/wallet/{telegram_id}/balances
+    בסיס ל-API הפנימי.
+    קודם מנסה settings.base_url, אחר כך משתנה סביבה BASE_URL.
     """
-    base = (
-        settings.API_BASE_URL
-        or settings.FRONTEND_API_BASE
-        or settings.BASE_URL
-    )
-    return (base or "").rstrip("/")
-
-
-def _format_float(value: float, decimals: int = 2) -> str:
-    fmt = f"{{:.{decimals}f}}"
-    return fmt.format(value)
-
-
-async def _telegram_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{TELEGRAM_API_BASE}/{method}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok"):
-            logger.error("Telegram API error: %s", data)
-        return data
-
-
-async def send_message(
-    chat_id: int,
-    text: str,
-    parse_mode: Optional[str] = None,
-    disable_web_page_preview: bool = False,
-) -> None:
-    if not settings.telegram_bot_token:
-        logger.warning("send_message called but TELEGRAM_BOT_TOKEN is missing")
-        return
-
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": disable_web_page_preview,
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-
-    try:
-        await _telegram_post("sendMessage", payload)
-    except Exception:
-        logger.exception("Failed to send Telegram message")
+    return getattr(settings, "base_url", None) or os.getenv("BASE_URL", "").rstrip("/")
 
 
 async def _fetch_bnb_price_usd() -> float:
     """
-    מביא מחיר BNB ב-USD (אפשר להחליף למקור אחר בעתיד).
-    במקרה כשל – מחזיר 0 כדי שלא יפיל את כל הזרימה.
+    משיכת מחיר BNB/USD מ-Coingecko עם קאשינג כדי להקטין Rate Limit (429).
+    במקרה של תקלה – נחזיר את הערך האחרון בקאש (אם קיים), אחרת 0.
     """
+    global _BNB_PRICE_CACHE, _BNB_PRICE_CACHE_TS
+
+    if _BNB_PRICE_CACHE is not None and _BNB_PRICE_CACHE_TS is not None:
+        if datetime.utcnow() - _BNB_PRICE_CACHE_TS < timedelta(minutes=5):
+            return _BNB_PRICE_CACHE
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": "binancecoin", "vs_currencies": "usd"},
-            )
-            r.raise_for_status()
-            data = r.json()
-            return float(data["binancecoin"]["usd"])
-    except Exception:
-        logger.exception("Failed to fetch BNB price, falling back to 0")
-        return 0.0
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(BNB_PRICE_API)
+        resp.raise_for_status()
+        data = resp.json()
+        price = float(data.get("binancecoin", {}).get("usd", 0.0) or 0.0)
+        if price > 0:
+            _BNB_PRICE_CACHE = price
+            _BNB_PRICE_CACHE_TS = datetime.utcnow()
+        return price
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to fetch BNB price from CoinGecko (using cache/fallback): %s",
+            exc,
+        )
+        return _BNB_PRICE_CACHE or 0.0
 
 
 def _get_slh_price_usd() -> float:
     """
-    מחיר SLH ב-USD (אם תרצה להשתמש בעתיד).
-    כרגע נשען על ENV SLH_USD_PRICE או 0.
+    מחיר SLH בדולרים מתוך משתנה סביבה SLH_USD_PRICE (או 0 אם לא הוגדר).
     """
-    return SLH_USD_FALLBACK
+    try:
+        return float(os.getenv("SLH_USD_PRICE") or "0")
+    except Exception:
+        return 0.0
 
 
-async def _api_get_wallet_balances(telegram_id: int) -> Dict[str, Any]:
-    """
-    קריאה ל-API הפנימי:
-    GET /api/wallet/{telegram_id}/balances
-    """
-    base = _api_base_url()
-    url = f"{base}/api/wallet/{telegram_id}/balances"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        return r.json()
-
-
-async def _api_set_wallet(
-    telegram_id: int,
-    bnb_address: str,
-    ton_address: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    קריאה ל-API הפנימי:
-    POST /api/wallet/set
-    Body: { telegram_id, bnb_address, ton_address }
-    """
-    base = _api_base_url()
-    url = f"{base}/api/wallet/set"
-    payload = {
-        "telegram_id": str(telegram_id),
-        "bnb_address": bnb_address,
-        "ton_address": ton_address,
-    }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        return r.json()
-
-
-async def _notify_admin_management_request(
-    telegram_id: int,
-    username: Optional[str],
-    chat_id: int,
+async def send_message(
+    chat_id: int | str,
+    text: str,
+    reply_markup: Optional[Dict[str, Any]] = None,
+    parse_mode: Optional[str] = None,
 ) -> None:
-    """שולח אליך לוג על בקשת ניהול חדשה."""
-    admin_chat_id = settings.ADMIN_LOG_CHAT_ID or os.getenv("ADMIN_LOG_CHAT_ID")
-    if not admin_chat_id:
+    """
+    עטיפה נוחה ל-sendMessage עם אפשרות ל-reply keyboard.
+    """
+    if not settings.telegram_bot_token:
+        logger.warning("telegram_bot_token not configured – cannot send message")
         return
 
-    text = (
-        "📥 בקשת גישת ניהול חדשה\n\n"
-        f"🔹 User: @{username or 'unknown'}\n"
-        f"🔹 telegram_id: {telegram_id}\n"
-        f"🔹 chat_id: {chat_id}\n\n"
-        "המשתמש הפעיל את /admin וביקש להצטרף לצוות הניהול."
-    )
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+
+    payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
 
     try:
-        await send_message(int(admin_chat_id), text)
-    except Exception:
-        logger.exception("Failed to send admin management request log")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload)
+        if resp.status_code != 200:
+            logger.warning(
+                "Telegram sendMessage failed: %s %s",
+                resp.status_code,
+                resp.text,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error while sending Telegram message: %s", exc)
 
 
-# ============================
-#   Webhook Route
-# ============================
+def _extract_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    תמיכה ב-update מסוג message / edited_message.
+    (כרגע מתעלמים מ-callback_query כדי לשמור את הקוד פשוט.)
+    """
+    if "message" in update:
+        return update["message"]
+    if "edited_message" in update:
+        return update["edited_message"]
+    return None
+
+
+async def _fetch_balances_from_api(telegram_id: str) -> Optional[Dict[str, Any]]:
+    """
+    קריאה ל-GET /api/wallet/{telegram_id}/balances כדי להביא נתונים חיים מהרשת.
+    """
+    base_url = _api_base_url()
+    if not base_url:
+        logger.warning("BASE_URL not configured – cannot call balances API")
+        return None
+
+    url = f"{base_url}/api/wallet/{telegram_id}/balances"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info("Balances API response for %s: %s", telegram_id, data)
+        return data
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to fetch balances from API: %s", exc)
+        return None
 
 
 @router.post("/webhook")
-async def telegram_webhook(request: Request) -> Dict[str, Any]:
-    update = await request.json()
-    logger.debug("Telegram update received: %s", update)
-
-    message = update.get("message") or update.get("edited_message") or {}
+async def telegram_webhook(
+    update: Dict[str, Any],
+    db: Session = Depends(get_db),
+):
+    """
+    Webhook פשוט לבוט הקהילה.
+    מנהל את הפקודות:
+    /start, /wallet, /set_wallet, /balances, /send_slh
+    """
+    message = _extract_message(update)
     if not message:
         return {"ok": True}
 
+    text: str = (message.get("text") or "").strip()
     chat = message.get("chat") or {}
     from_user = message.get("from") or {}
 
     chat_id = chat.get("id")
-    telegram_id = from_user.get("id")
+    telegram_id = (
+        str(from_user.get("id")) if from_user.get("id") is not None else None
+    )
     username = from_user.get("username")
+    first_name = from_user.get("first_name")
 
-    if chat_id is None or telegram_id is None:
-        logger.warning("Missing chat_id or telegram_id in update")
-        return {"ok": True}
+    if not chat_id or not telegram_id:
+        return {"ok": False}
 
-    text: str = (message.get("text") or "").strip()
+    # מקלדת ברירת מחדל
+    default_keyboard: Dict[str, Any] = {
+        "keyboard": [
+            [{"text": "/wallet"}, {"text": "/balances"}],
+            [{"text": "/send_slh 10 @username"}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
 
     # ----- /start -----
     if text.startswith("/start"):
-        community_link = (
-            settings.COMMUNITY_LINK
-            or os.getenv("COMMUNITY_LINK")
-            or "https://t.me/+HIzvM8sEgh1kNWY0"
+        community_link = getattr(settings, "community_link", None) or os.getenv(
+            "COMMUNITY_LINK"
         )
 
         base_text = (
@@ -204,99 +195,95 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
             "פקודות זמינות:\n"
             "/wallet - רישום/עדכון הארנק שלך\n"
             "/balances - צפייה ביתרות החיות על רשת BSC\n"
-            "/admin - בקשת גישת ניהול במערכת\n"
+            "/send_slh <amount> <@username|telegram_id> - העברת SLH וירטואלית בין משתמשי הקהילה\n"
         )
+        if community_link:
+            base_text += f"\n🔗 קישור לקהילה: {community_link}"
 
-        extra = (
-            f"\n🔗 קישור לקהילה: {community_link}\n"
-            "הצטרף כדי לקבל גישה מלאה, תמריצים וכלי ניהול קהילה מתקדמים.\n"
+        await send_message(
+            chat_id,
+            base_text,
+            reply_markup=default_keyboard,
         )
-
-        await send_message(chat_id, base_text + extra)
         return {"ok": True}
 
     # ----- /wallet -----
     if text.startswith("/wallet"):
-        help_text = (
-            "📲 רישום / עדכון ארנק SLH\n\n"
-            "שלח לי את כתובת ה-BNB שלך (אותה כתובת משמשת גם למטבע SLH):\n"
-            "/set_wallet <כתובת_BNB>\n\n"
-            "אם כבר יש לך גם ארנק TON, אתה יכול להוסיף אותו:\n"
-            "/set_wallet <כתובת_BNB> <כתובת_TON>\n\n"
-            "דוגמה:\n"
-            "/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4\n"
-            "/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4 UQCXXXXX...\n"
+        await send_message(
+            chat_id,
+            (
+                "📲 רישום / עדכון ארנק SLH\n\n"
+                "שלח לי את כתובת ה-BNB שלך (אותה כתובת משמשת גם למטבע SLH):\n"
+                "/set_wallet <כתובת_BNB>\n\n"
+                "אם כבר יש לך גם ארנק TON, אתה יכול להוסיף אותו:\n"
+                "/set_wallet <כתובת_BNB> <כתובת_TON>\n\n"
+                "דוגמה:\n"
+                "/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4\n"
+                "/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4 UQCXXXXX..."
+            ),
+            reply_markup=default_keyboard,
         )
-        await send_message(chat_id, help_text)
         return {"ok": True}
 
     # ----- /set_wallet -----
     if text.startswith("/set_wallet"):
         parts = text.split()
-        if len(parts) < 2:
+        args = parts[1:]
+        if len(args) == 0:
             await send_message(
                 chat_id,
-                "⚠ שימוש: /set_wallet <כתובת_BNB> [כתובת_TON]\n"
-                "דוגמה:\n"
-                "/set_wallet 0x1234...\n"
-                "/set_wallet 0x1234... UQXXXXX...",
+                "שימוש: /set_wallet <כתובת_BNB> [כתובת_TON]",
+                reply_markup=default_keyboard,
             )
             return {"ok": True}
 
-        bnb_address = parts[1].strip()
-        ton_address = parts[2].strip() if len(parts) >= 3 else None
+        bnb_address = args[0].strip()
+        ton_address = args[1].strip() if len(args) > 1 else None
 
         try:
-            await _api_set_wallet(telegram_id=telegram_id, bnb_address=bnb_address, ton_address=ton_address)
-        except Exception:
-            logger.exception("Failed to set wallet via API")
+            upsert_wallet(
+                db=db,
+                telegram_id=telegram_id,
+                username=username,
+                first_name=first_name,
+                bnb_address=bnb_address,
+                ton_address=ton_address,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to upsert wallet: %s", exc)
             await send_message(
                 chat_id,
-                "❌ שגיאה בשמירת הארנק. נסה שוב מאוחר יותר.",
+                "❌ לא הצלחתי לעדכן את הארנק. נסה שוב מאוחר יותר.",
+                reply_markup=default_keyboard,
             )
-            return {"ok": True}
+            return {"ok": False}
 
-        confirm_text = (
+        text_reply = (
             "✅ הארנק עודכן בהצלחה!\n\n"
             f"BNB/SLH: {bnb_address}\n"
             f"TON: {ton_address or '-'}"
         )
-        await send_message(chat_id, confirm_text)
+        await send_message(chat_id, text_reply, reply_markup=default_keyboard)
         return {"ok": True}
 
     # ----- /balances -----
     if text.startswith("/balances"):
-        try:
-            data = await _api_get_wallet_balances(telegram_id)
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                await send_message(
-                    chat_id,
-                    "לא נמצא ארנק עבור המשתמש הזה.\n"
-                    "השתמש ב-/wallet כדי להגדיר ארנק קודם.",
-                )
-                return {"ok": True}
-            logger.exception("Failed to fetch balances from API")
+        balances = await _fetch_balances_from_api(telegram_id)
+        if balances is None:
             await send_message(
                 chat_id,
-                "❌ שגיאה בשליפת היתרות. נסה שוב מאוחר יותר.",
-            )
-            return {"ok": True}
-        except Exception:
-            logger.exception("Failed to fetch balances from API")
-            await send_message(
-                chat_id,
-                "❌ שגיאה בשליפת היתרות. נסה שוב מאוחר יותר.",
+                "לא נמצא ארנק למשתמש זה. השתמש ב-/wallet כדי להגדיר ארנק.",
+                reply_markup=default_keyboard,
             )
             return {"ok": True}
 
-        bnb_address = data.get("bnb_address") or "-"
-        ton_address = data.get("ton_address") or "-"
+        bnb_address = balances.get("bnb_address") or "-"
+        ton_address = balances.get("ton_address") or "-"
+        slh_address = balances.get("slh_address") or bnb_address
 
-        bnb_balance = float(data.get("bnb_balance") or 0.0)
-        slh_balance = float(data.get("slh_balance") or 0.0)
+        bnb_balance = float(balances.get("bnb_balance", 0.0) or 0.0)
+        slh_balance = float(balances.get("slh_balance", 0.0) or 0.0)
 
-        # 2) מחירים בדולרים (BNB) + מחיר קבוע ל-SLH בשקלים
         bnb_price_usd = await _fetch_bnb_price_usd()
         slh_price_usd = _get_slh_price_usd()
 
@@ -304,65 +291,128 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
         slh_value_usd = slh_balance * slh_price_usd if slh_price_usd > 0 else 0.0
         total_usd = bnb_value_usd + slh_value_usd
 
-        # מחיר SLH קבוע במונחי ₪ – "מספר ההצלחה"
-        slh_price_ils = getattr(settings, "slh_ils_price", None) or SLH_ILS_FALLBACK
-        slh_value_ils = slh_balance * slh_price_ils
+        lines = [
+            "📊 יתרות ארנק (חי מ-BSC):",
+            "",
+            f"BNB / SLH כתובת: {bnb_address}",
+            f"TON: {ton_address or '-'}",
+            "",
+            f"BNB: {bnb_balance:.6f} (~${bnb_value_usd:,.2f})",
+            f"SLH: {slh_balance:.4f}"
+            + (f" (~${slh_value_usd:,.2f})" if slh_price_usd > 0 else ""),
+            "",
+            f"≈ שווי כולל (BNB+SLH): ~${total_usd:,.2f}",
+        ]
 
-        slh_price_line = (
-            f"מחיר SLH קבוע במערכת: ~₪{_format_float(slh_price_ils, 2)}"
-        )
-        if slh_balance > 0:
-            slh_value_line = f"≈ ₪{_format_float(slh_value_ils, 2)}"
-        else:
-            slh_value_line = "≈ ₪0.00"
-
-        balances_text = (
-            "יתרות ארנק (חיבור חי ל-BSC):\n\n"
-            f"BNB / SLH כתובת: {bnb_address}\n"
-            f"TON: {ton_address}\n\n"
-            f"BNB balance: {_format_float(bnb_balance, 6)} "
-            f"(≈ ${_format_float(bnb_value_usd, 2)})\n"
-            f"SLH balance: {_format_float(slh_balance, 4)} "
-            f"({slh_value_line})\n\n"
-            "הנתונים מחושבים בזמן אמת מרשת BNB Smart Chain על בסיס הכתובת השמורה בארנק הקהילה.\n\n"
-            f"מחיר BNB משוער: ~${_format_float(bnb_price_usd, 2)}\n"
-            f"{slh_price_line}\n\n"
-            f"≈ שווי כולל (BNB+SLH): ${_format_float(total_usd, 2)}"
-        )
-
-        await send_message(chat_id, balances_text)
-        return {"ok": True}
-
-    # ----- /admin -----
-    if text.startswith("/admin"):
         await send_message(
             chat_id,
-            (
-                "🧩 בקשת ניהול במערכת SLHNET\n\n"
-                "איזה תחום ניהול הכי מדבר אליך?\n\n"
-                "1. ניהול קהילה 👥\n"
-                "2. ניהול תוכן 📝\n"
-                "3. ניהול פיננסי 💰\n"
-                "4. ניהול טכני / פיתוח 🛠️\n"
-                "5. אקדמיה ומומחים 🎓\n\n"
-                "ענה כאן במספר או במילים חופשיות, "
-                "ואנחנו נבחן את הבקשה שלך וניתן לך מסלול קידום ותמריצים מותאם. 🚀"
-            ),
+            "\n".join(lines),
+            reply_markup=default_keyboard,
+        )
+        return {"ok": True}
+
+    # ----- /send_slh -----
+    if text.startswith("/send_slh"):
+        parts = text.split()
+        args = parts[1:]
+        if len(args) < 2:
+            await send_message(
+                chat_id,
+                "שימוש: /send_slh <amount> <@username|telegram_id> [הערה]",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        amount_raw = args[0]
+        target_raw = args[1]
+        note = " ".join(args[2:]) if len(args) > 2 else None
+
+        try:
+            amount = float(amount_raw)
+            if amount <= 0:
+                raise ValueError("amount must be positive")
+        except Exception:
+            await send_message(
+                chat_id,
+                "❌ סכום לא חוקי. השתמש לדוגמה: /send_slh 100 @username",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        from_wallet = db.get(Wallet, telegram_id)
+        if not from_wallet:
+            await send_message(
+                chat_id,
+                "אין לך ארנק מוגדר. השתמש ב-/wallet כדי להגדיר ארנק לפני העברה.",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        # חיפוש נמען לפי username או לפי telegram_id
+        to_wallet: Optional[Wallet]
+        if target_raw.startswith("@"):
+            target_username = target_raw[1:]
+            to_wallet = (
+                db.query(Wallet)
+                .filter(Wallet.username == target_username)
+                .first()
+            )
+            to_label = f"@{target_username}"
+        else:
+            to_wallet = db.get(Wallet, target_raw)
+            to_label = f"user_id={target_raw}"
+
+        if not to_wallet:
+            await send_message(
+                chat_id,
+                "❌ לא נמצא נמען עם הנתון שסיפקת. ודא שיש לו ארנק בקהילה (פקודת /wallet).",
+                reply_markup=default_keyboard,
+            )
+            return {"ok": True}
+
+        # בשלב זה ההעברה היא וירטואלית בלבד – רישום לוג בלבד ללא שינוי on-chain
+        logger.info(
+            "Simulated internal transfer: from=%s to=%s amount=%s note=%s",
+            telegram_id,
+            to_wallet.telegram_id,
+            amount,
+            note,
         )
 
-        await _notify_admin_management_request(
-            telegram_id=telegram_id,
-            username=username,
-            chat_id=chat_id,
+        confirm_text_sender = (
+            "✅ בקשת העברה התקבלה!\n\n"
+            f"שלחת (וירטואלי בשלב זה) {amount} SLH אל {to_label}.\n"
         )
+        if note:
+            confirm_text_sender += f"\nהערה: {note}"
+
+        await send_message(
+            chat_id,
+            confirm_text_sender,
+            reply_markup=default_keyboard,
+        )
+
+        # הודעה לנמען (אם מדובר בצ'אט פרטי רגיל)
+        try:
+            await send_message(
+                to_wallet.telegram_id,
+                (
+                    "📥 קיבלת העברת SLH וירטואלית מהקהילה!\n\n"
+                    f"שולח: @{username or telegram_id}\n"
+                    f"סכום: {amount} SLH\n"
+                    + (f"\nהערה: {note}" if note else "")
+                ),
+                reply_markup=default_keyboard,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to notify recipient about transfer: %s", exc)
 
         return {"ok": True}
 
-    # ----- Fallback -----
+    # ----- פקודה לא מוכרת -----
     await send_message(
         chat_id,
-        "לא זיהיתי את הפקודה.\n"
-        "נסה אחת מהפקודות:\n"
-        "/wallet, /balances, /admin",
+        "❓ פקודה לא מוכרת. השתמש ב-/wallet כדי להתחיל.",
+        reply_markup=default_keyboard,
     )
     return {"ok": True}
