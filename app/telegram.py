@@ -8,8 +8,8 @@ from typing import Any, Dict, Optional, List
 
 import httpx
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
 from sqlalchemy import or_
+from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import get_db
@@ -34,9 +34,12 @@ _BNB_PRICE_CACHE_TS: Optional[datetime] = None
 def _api_base_url() -> str:
     """
     בסיס ל-API הפנימי.
-    קודם מנסה settings.base_url, אחר כך משתנה סביבה BASE_URL.
+    קודם מנסה settings.base_url, אחר כך משתנה סביבה BASE_URL או API_BASE_URL.
     """
-    return getattr(settings, "base_url", None) or os.getenv("BASE_URL", "").rstrip("/")
+    base = getattr(settings, "base_url", None) or os.getenv("BASE_URL") or os.getenv(
+        "API_BASE_URL", "http://localhost:8000"
+    )
+    return base.rstrip("/")
 
 
 async def _fetch_bnb_price_usd() -> float:
@@ -76,6 +79,19 @@ def _get_slh_price_usd() -> float:
         return float(os.getenv("SLH_USD_PRICE") or "0")
     except Exception:
         return 0.0
+
+
+def _is_admin(telegram_id: str) -> bool:
+    """
+    בודק אם המשתמש הוא אדמין ראשי לפי ENV (ADMIN_OWNER_IDS).
+    """
+    owners = getattr(settings, "admin_owner_ids", []) or []
+    return str(telegram_id) in [str(x) for x in owners]
+
+
+def _onchain_enabled() -> bool:
+    flag = (os.getenv("SLH_ONCHAIN_ENABLED", "false") or "false").lower()
+    return flag in ("1", "true", "yes")
 
 
 async def send_message(
@@ -130,7 +146,7 @@ async def _fetch_balances_from_api(telegram_id: str) -> Optional[Dict[str, Any]]
     """
     base_url = _api_base_url()
     if not base_url:
-        logger.warning("BASE_URL not configured – cannot call balances API")
+        logger.warning("BASE_URL/API_BASE_URL not configured – cannot call balances API")
         return None
 
     url = f"{base_url}/api/wallet/{telegram_id}/balances"
@@ -154,9 +170,9 @@ async def telegram_webhook(
     db: Session = Depends(get_db),
 ):
     """
-    Webhook פשוט לבוט הקהילה.
+    Webhook לבוט הקהילה.
     מנהל את הפקודות:
-    /start, /wallet, /set_wallet, /balances, /send_slh
+    /start, /wallet, /set_wallet, /balances, /send_slh, /history, /claim, /airdrop, /admin
     """
     message = _extract_message(update)
     if not message:
@@ -176,10 +192,7 @@ async def telegram_webhook(
     if not chat_id or not telegram_id:
         return {"ok": False}
 
-    # מקלדת ברירת מחדל
-    default_keyboard: Dict[str, Any] = {
-        "keyboard": [
-            [{"text": "/wallet"}, {"text": "/balances    # מקלדת ברירת מחדל
+    # מקלדת ברירת מחדל לכל המשתמשים
     default_keyboard: Dict[str, Any] = {
         "keyboard": [
             [{"text": "/wallet"}, {"text": "/balances"}],
@@ -190,15 +203,9 @@ async def telegram_webhook(
         "one_time_keyboard": False,
     }
 
-    def _is_admin(telegram_id: str) -> bool:
-        """בודק אם המשתמש הוא אדמין ראשי לפי ENV (ADMIN_OWNER_IDS)."""
-        owners = getattr(settings, "admin_owner_ids", []) or []
-        return str(telegram_id) in [str(x) for x in owners]
-
-    def _onchain_enabled() -> bool:
-        flag = (os.getenv("SLH_ONCHAIN_ENABLED", "false") or "false").lower()
-        return flag in ("1", "true", "yes")
-nv(
+    # ----- /start -----
+    if text.startswith("/start"):
+        community_link = getattr(settings, "community_link", None) or os.getenv(
             "COMMUNITY_LINK"
         )
 
@@ -208,8 +215,12 @@ nv(
             "פקודות זמינות:\n"
             "/wallet - רישום/עדכון הארנק שלך\n"
             "/balances - צפייה ביתרות החיות על רשת BSC\n"
-            "/send_slh <amount> <@username|telegram_id> - העברת SLH וירטואלית בין משתמשי הקהילה\n"
+            "/send_slh <amount> <@username|telegram_id> - העברת SLH בין משתמשי הקהילה\n"
+            "/history - היסטוריית העברות\n"
+            "/claim - קליימים וריוורדים\n"
         )
+        if _is_admin(telegram_id):
+            base_text += "/admin - פאנל אדמין\n"
         if community_link:
             base_text += f"\n🔗 קישור לקהילה: {community_link}"
 
@@ -226,9 +237,9 @@ nv(
             chat_id,
             (
                 "📲 רישום / עדכון ארנק SLH\n\n"
-                "שלח לי את כתובת ה-BNB שלך (אותה כתובת משמשת גם למטבע SLH):\n"
+                "שלח את כתובת ה-BNB שלך (אותה כתובת משמשת גם ל-SLH):\n"
                 "/set_wallet <כתובת_BNB>\n\n"
-                "אם כבר יש לך גם ארנק TON, אתה יכול להוסיף אותו:\n"
+                "אם יש לך גם ארנק TON, אפשר להוסיף אותו:\n"
                 "/set_wallet <כתובת_BNB> <כתובת_TON>\n\n"
                 "דוגמה:\n"
                 "/set_wallet 0xd0617b54fb4b6b66307846f217b4d685800e3da4\n"
@@ -308,6 +319,7 @@ nv(
             "📊 יתרות ארנק (חי מ-BSC):",
             "",
             f"BNB / SLH כתובת: {bnb_address}",
+            f"SLH כתובת: {slh_address}",
             f"TON: {ton_address or '-'}",
             "",
             f"BNB: {bnb_balance:.6f} (~${bnb_value_usd:,.2f})",
@@ -410,9 +422,14 @@ nv(
                 db.add(tx)
                 db.commit()
             except OnchainConfigError as ocfg:
-                logger.warning("On-chain disabled/misconfigured, using internal only: %s", ocfg)
+                logger.warning(
+                    "On-chain disabled/misconfigured, using internal only: %s", ocfg
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Failed to send on-chain transfer, keeping internal record only: %s", exc)
+                logger.exception(
+                    "Failed to send on-chain transfer, keeping internal record only: %s",
+                    exc,
+                )
 
         confirm_text_sender = (
             "✅ בקשת העברה התקבלה!\n\n"
@@ -452,7 +469,6 @@ nv(
             logger.warning("Failed to notify recipient about transfer: %s", exc)
 
         return {"ok": True}
-
 
     # ----- /history -----
     if text.startswith("/history"):
@@ -621,8 +637,8 @@ nv(
             "🛠 פאנל אדמין SLH:",
             "",
             "/airdrop <amount> <@user1|id1> [@user2|id2 …] – חלוקת SLH למשתמשים",
-            "/history – צפייה בהיסטוריית העברות (גם לך וגם להם)",
-            "/claim – בדיקת מנגנון קליימים (לבדיקות / משחקים)",
+            "/history – צפייה בהיסטוריית העברות",
+            "/claim – בדיקת מנגנון קליימים",
             "",
             "✨ בעתיד נוסיף כאן גם:",
             "- דוחות רבעוניים למשקיעים",
@@ -636,6 +652,7 @@ nv(
             reply_markup=default_keyboard,
         )
         return {"ok": True}
+
     # ----- פקודה לא מוכרת -----
     await send_message(
         chat_id,
